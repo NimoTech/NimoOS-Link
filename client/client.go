@@ -102,9 +102,14 @@ func (c *Client) dial(ctx context.Context, network, addr string) (net.Conn, erro
 	if c.Dial != nil {
 		return c.Dial(ctx, network, addr)
 	}
-	var d net.Dialer
+	d := net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
 	return d.DialContext(ctx, network, addr)
 }
+
+// dialTimeout bounds one TCP connect to the relay. Without it a lost SYN
+// leaves the device waiting for the kernel's own limit (over two minutes)
+// before it can retry.
+var dialTimeout = 10 * time.Second
 
 func (c *Client) tlsConfig() *tls.Config {
 	cfg := &tls.Config{}

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -88,5 +89,22 @@ func TestNextTSClockStepBack(t *testing.T) {
 	}
 	if got := c.nextTS(); got != now.Unix()+1 {
 		t.Errorf("next ts = %d", got)
+	}
+}
+
+// A lost SYN must not hold the device for the kernel's own two minutes.
+func TestDialGivesUpWithinTheTimeout(t *testing.T) {
+	old := dialTimeout
+	dialTimeout = 300 * time.Millisecond
+	defer func() { dialTimeout = old }()
+	c := &Client{}
+	start := time.Now()
+	conn, err := c.dial(context.Background(), "tcp", "192.0.2.1:443") // TEST-NET-1: never answers
+	if err == nil {
+		conn.Close()
+		t.Skip("192.0.2.1 answered on this network")
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("dial took %v", took)
 	}
 }
