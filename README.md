@@ -39,3 +39,19 @@ Go 1.21. The only dependency is `github.com/hashicorp/yamux`.
 ## License
 
 Apache-2.0, see `LICENSE`.
+
+## nimolink — command-line client
+
+`nimolink/` is a small Linux client for NimoLink direct connections (a WireGuard tunnel from a paired device to the NAS). It is the reference implementation of the pairing protocol:
+
+    cd nimolink && go build -o nimolink .
+    sudo ./nimolink pair 192.168.1.118   # on the home network
+    sudo ./nimolink up
+    sudo ./nimolink status
+    sudo ./nimolink down
+
+A device that is already paired is not paired twice: `pair` refuses, and `sudo ./nimolink pair <NAS address> -replace` pairs again and removes the old device from the NAS once the new pairing is saved (run `nimolink down` first if the tunnel is up).
+
+Run every command with sudo: the tunnel belongs to root, and the configuration lives in root's config directory unless `NIMOLINK_CONFIG` names another.
+
+It is its own Go module and needs Go 1.23.1 or newer (the library needs only Go 1.21).

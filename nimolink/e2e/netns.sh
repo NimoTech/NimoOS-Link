@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# End-to-end check on one machine: a client in its own network namespace on
+# the NAS pairs over a private "home network" link, connects, reaches the
+# panel through the tunnel, is refused what a VPN client may not do, cannot
+# get past the NAS, and is cut off when its device is removed.
+#
+#   sudo NAS_USER=<account> BIN=/path/to/nimolink bash netns.sh
+#
+# The account's password is asked for on the terminal (it never goes on a
+# command line). Optional: DOCKER_PORT=<port of a published Docker app>.
+# Do not run it with `bash -x`: that would trace the password and the token.
+set -euo pipefail
+: "${NAS_USER:?}" "${BIN:?path to the nimolink binary}"
+[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+
+NS=nlc HOST_IF=nlc-host HOST_IP=10.199.0.1 NS_IP=10.199.0.2
+WORK="" DEVICE_ID="" TOKEN="" REVOKED=0 MADE_NS=0 MADE_LINK=0 CLIENT_STARTED=0
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok()   { echo "ok: $*"; }
+inns() { ip netns exec "$NS" "$@"; }
+
+for tool in python3 curl ip ss; do
+  command -v "$tool" >/dev/null 2>&1 || fail "$tool is required but not installed"
+done
+
+# Refuse to touch anything that already exists on this host.
+netns_list=$(ip netns list 2>/dev/null || true)
+links=$(ip -o link show 2>/dev/null || true)
+addrs=$(ip -o -4 addr show 2>/dev/null || true)
+routes=$(ip -4 route show 2>/dev/null || true)
+[[ $netns_list =~ (^|$'\n')$NS([[:space:]]|$) ]] && fail "a network namespace named $NS already exists"
+[[ $links =~ :[[:space:]]($HOST_IF|nlc-ns)[@:[:space:]] ]] && fail "a link named $HOST_IF or nlc-ns already exists"
+[[ $addrs =~ 10\.199\.0\. || $routes =~ 10\.199\.0\. ]] && fail "10.199.0.0/24 is already in use on this host"
+# `ip netns exec` does not isolate /run: a real tunnel would collide with ours.
+for f in /run/nimolink.pid /var/run/wireguard/nimolink0.sock; do
+  [ ! -e "$f" ] || fail "$f exists: a nimolink tunnel is running on this host; stop it first"
+done
+
+if [ -z "${NIMOLINK_PASSWORD:-}" ]; then
+  [ -t 0 ] || fail "no terminal to ask the password on: run this from a terminal"
+  read -rs -p "Password for $NAS_USER: " NIMOLINK_PASSWORD; echo
+  [ -n "$NIMOLINK_PASSWORD" ] || fail "empty password"
+fi
+export NAS_USER NIMOLINK_PASSWORD
+
+
+WORK=$(mktemp -d)           # mode 0700
+export NIMOLINK_CONFIG="$WORK"
+AUTH="$WORK/auth"           # curl header file; the token never goes on a command line
+
+REVOKE_CODE=""
+revoke() { # host side, over the private link; succeeds only on HTTP 200
+  [ -n "$DEVICE_ID" ] && [ -n "$TOKEN" ] || return 1
+  REVOKE_CODE=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X DELETE -H @"$AUTH" "http://$HOST_IP/v1/users/remote/devices/$DEVICE_ID") || true
+  [ "$REVOKE_CODE" = 200 ]
+}
+
+cleanup() {
+  trap - EXIT
+  if [ -n "$DEVICE_ID" ] && [ "$REVOKED" = 0 ]; then
+    if revoke; then
+      echo "removed the test device $DEVICE_ID"
+    else
+      echo "NOTE: test device $DEVICE_ID was NOT removed (HTTP ${REVOKE_CODE:-none}, or no access token): remove it in the panel's device list" >&2
+    fi
+  fi
+  # Only what this run created is touched. No `nimolink down` here: it acts
+  # on the host-wide pid file and could stop a real tunnel.
+  if [ "$MADE_NS" = 1 ]; then
+    ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
+    for _ in $(seq 1 25); do
+      [ -n "$(ip netns pids "$NS" 2>/dev/null)" ] || break
+      sleep 0.2
+    done
+    ip netns pids "$NS" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    sleep 0.3
+    ip netns del "$NS" 2>/dev/null || true
+  fi
+  [ "$MADE_LINK" = 0 ] || ip link del "$HOST_IF" 2>/dev/null || true
+  if [ "$CLIENT_STARTED" = 1 ]; then
+    for f in /run/nimolink.pid /var/run/wireguard/nimolink0.sock; do
+      if [ -e "$f" ]; then rm -f "$f"; echo "removed leftover $f"; fi
+    done
+  fi
+  [ -z "$WORK" ] || rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+ip netns add "$NS"; MADE_NS=1
+ip link add "$HOST_IF" type veth peer name nlc-ns; MADE_LINK=1
+ip link set nlc-ns netns "$NS"
+ip addr add "$HOST_IP/24" dev "$HOST_IF" && ip link set "$HOST_IF" up
+inns ip addr add "$NS_IP/24" dev nlc-ns
+inns ip link set nlc-ns up && inns ip link set lo up
+
+# 1. pair over the "home network" link
+inns "$BIN" pair "$HOST_IP" -user "$NAS_USER" -name "e2e-netns" || fail "pairing (if the NAS did accept it, a device named e2e-netns may be on the account: remove it in the panel)"
+read -r NAS_VIP DEVICE_ID CLIENT_VIP < <(python3 -c "
+import json,os
+c=json.load(open(os.environ['NIMOLINK_CONFIG']+'/config.json'))
+print(c['nas_address'], c['device_id'], c['client_address'])") || true
+[[ $DEVICE_ID =~ ^[0-9]+$ && -n $NAS_VIP && -n $CLIENT_VIP ]] || fail "pairing may have succeeded but the config could not be read back: a device named e2e-netns may have been left on the account, remove it in the panel's device list"
+ok "paired as device $DEVICE_ID; the NAS is $NAS_VIP"
+
+# 2. connect. The home router's address is sent into the tunnel as well, to
+#    show in step 6 that the NAS passes nothing on.
+GW=$(ip route show default | awk '{print $3; exit}')
+CLIENT_STARTED=1
+inns "$BIN" up -test-allowed-ips "$GW/32" >"$NIMOLINK_CONFIG/up.log" 2>&1 &
+for i in $(seq 1 20); do grep -q "^connected" "$NIMOLINK_CONFIG/up.log" && break; sleep 0.5; done
+grep -q "^connected" "$NIMOLINK_CONFIG/up.log" || { cat "$NIMOLINK_CONFIG/up.log"; fail "no handshake"; }
+inns "$BIN" status | grep -q "^direct to" || fail "status does not say direct"
+ok "tunnel up: $(inns "$BIN" status)"
+
+# 3. the panel answers on the virtual address
+code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$NAS_VIP/v1/gateway/device-info")
+[ "$code" = 200 ] || fail "panel over the tunnel: HTTP $code"
+ok "panel reachable over the tunnel"
+
+# 4. requests over the tunnel are labelled vpn: what is for the home network only is refused
+# The login body is built from the environment and goes to curl on stdin.
+TOKEN=$(python3 -c 'import json,os;print(json.dumps({"username":os.environ["NAS_USER"],"password":os.environ["NIMOLINK_PASSWORD"]}))' \
+  | inns curl -s -m 5 -H 'Content-Type: application/json' --data @- "http://$NAS_VIP/v1/users/login" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['token']['access_token'])" 2>/dev/null) || TOKEN=""
+[ -n "$TOKEN" ] || fail "sign-in over the tunnel (password only) did not work"
+printf 'Authorization: %s\n' "$TOKEN" >"$AUTH"
+code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST -H @"$AUTH" "http://$NAS_VIP/v1/users/remote/enroll-code")
+[ "$code" = 403 ] || fail "enroll-code over the tunnel: HTTP $code, want 403. If the NAS accepted it, an enrol code may have been issued: check the panel"
+code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' -X PUT -H @"$AUTH" -H 'Content-Type: application/json' -d '{"enabled":true}' "http://$NAS_VIP/v1/gateway/link")
+[ "$code" = 403 ] || fail "PUT /v1/gateway/link over the tunnel: HTTP $code, want 403. If the NAS accepted it, the remote-access switch may have been changed: check the panel"
+code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST -H @"$AUTH" -H 'Content-Type: application/json' -d '{"public_key":"x"}' "http://$NAS_VIP/v1/gateway/direct/pair")
+[ "$code" = 403 ] || fail "pairing over the tunnel: HTTP $code, want 403"
+ok "vpn label: enroll-code, the remote access switch and pairing are refused over the tunnel"
+
+# 5. another port of the NAS (ssh), if it listens
+listening=$(ss -ltn)
+if [[ $listening =~ :22[[:space:]] ]]; then
+  inns timeout 3 bash -c "exec 3<>/dev/tcp/$NAS_VIP/22" || fail "ssh port over the tunnel"
+  ok "ssh port reachable over the tunnel"
+fi
+
+# 5b. optional, informational: a Docker app published on DOCKER_PORT. A
+#     bridge-network container is reached by forwarding, which the NAS
+#     refuses for this interface, so this reports instead of failing.
+if [ -n "${DOCKER_PORT:-}" ]; then
+  if inns timeout 3 bash -c "exec 3<>/dev/tcp/$NAS_VIP/$DOCKER_PORT" 2>/dev/null; then
+    echo "info: docker port $DOCKER_PORT is reachable over the tunnel"
+  else
+    echo "info: docker port $DOCKER_PORT is NOT reachable over the tunnel"
+  fi
+fi
+
+# 6. the NAS forwards nothing. Asserted on the kernel's decision, not on a
+#    ping (a router with no route back would stay silent either way).
+route_out=$(ip route get "$GW" from "$CLIENT_VIP" iif nimo0 2>&1) && route_rc=0 || route_rc=$?
+echo "info: ip route get $GW from $CLIENT_VIP iif nimo0 (exit $route_rc): $route_out"
+if [ "$route_rc" = 0 ]; then
+  [[ $route_out == *prohibit* || $route_out == *unreachable* ]] || fail "the kernel would forward $CLIENT_VIP -> $GW from nimo0"
+  echo "info: refused by a prohibit/unreachable route"
+elif [[ $route_out == *"Permission denied"* ]]; then
+  echo "info: refused: Permission denied (the prohibit rule)"
+elif [[ $route_out == *"No route to host"* ]]; then
+  echo "info: refused: No route to host (the prohibit rule seen through forwarding=0)"
+else
+  fail "route lookup failed for another reason than a refusal: $route_out"
+fi
+[ "$(cat /proc/sys/net/ipv4/conf/nimo0/forwarding)" = 0 ] || fail "IPv4 forwarding is on for nimo0"
+rules=$(ip -4 rule show)
+grep -Eq '^5200:.*iif nimo0.*prohibit' <<<"$rules" || fail "no 'iif nimo0 prohibit' rule at priority 5200:
+$rules"
+ok "the NAS forwards nothing: forwarding off on nimo0, prohibit rule at priority 5200, route lookup refused"
+# secondary: the home router does not answer through the tunnel either
+if inns ping -c 2 -W 2 "$GW" >/dev/null 2>&1; then fail "the home router ($GW) answered through the tunnel"; fi
+
+# 7. removing the device cuts the tunnel within one sweep
+code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X DELETE -H @"$AUTH" "http://$HOST_IP/v1/users/remote/devices/$DEVICE_ID")
+[ "$code" = 200 ] || fail "removing the device: HTTP $code"
+REVOKED=1
+cut=no
+for i in $(seq 1 30); do
+  if ! inns curl -s -m 2 -o /dev/null "http://$NAS_VIP/v1/gateway/device-info"; then cut=yes; echo "cut off after ~${i}s"; break; fi
+  sleep 1
+done
+[ "$cut" = yes ] || fail "still connected 30 s after the device was removed"
+ok "removed device is cut off"
+echo "ALL OK"
