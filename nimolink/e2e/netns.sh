@@ -7,7 +7,10 @@
 #   sudo NAS_USER=<account> BIN=/path/to/nimolink bash netns.sh
 #
 # The account's password is asked for on the terminal (it never goes on a
-# command line). Optional: DOCKER_PORT=<port of a published Docker app>.
+# command line). Optional, for Docker apps on the NAS:
+#   DOCKER_PORT=<port a bridge-network app publishes on all addresses>  must answer
+#   DOCKER_LOOPBACK_PORT=<port an app publishes on 127.0.0.1 only>      must not
+#   DOCKER_CONTAINER_IP=<a container's address on its bridge>           must not be routed to
 # Do not run it with `bash -x`: that would trace the password and the token.
 set -euo pipefail
 : "${NAS_USER:?}" "${BIN:?path to the nimolink binary}"
@@ -139,31 +142,42 @@ if [[ $listening =~ :22[[:space:]] ]]; then
   ok "ssh port reachable over the tunnel"
 fi
 
-# 5b. optional, informational: a Docker app published on DOCKER_PORT. A
-#     bridge-network container is reached by forwarding, which the NAS
-#     refuses for this interface, so this reports instead of failing.
+# 5b. Docker apps (optional). A port published on all addresses answers on
+#     the virtual address: the NAS delivers it to Docker's proxy on this
+#     machine instead of forwarding it. A port published on 127.0.0.1 only
+#     does not.
 if [ -n "${DOCKER_PORT:-}" ]; then
-  if inns timeout 3 bash -c "exec 3<>/dev/tcp/$NAS_VIP/$DOCKER_PORT" 2>/dev/null; then
-    echo "info: docker port $DOCKER_PORT is reachable over the tunnel"
-  else
-    echo "info: docker port $DOCKER_PORT is NOT reachable over the tunnel"
+  inns timeout 3 bash -c "exec 3<>/dev/tcp/$NAS_VIP/$DOCKER_PORT" 2>/dev/null || fail "docker port $DOCKER_PORT is not reachable over the tunnel"
+  ok "docker port $DOCKER_PORT reachable over the tunnel"
+fi
+if [ -n "${DOCKER_LOOPBACK_PORT:-}" ]; then
+  [[ $listening =~ 127\.0\.0\.1:$DOCKER_LOOPBACK_PORT[[:space:]] ]] || fail "nothing listens on 127.0.0.1:$DOCKER_LOOPBACK_PORT: the check would prove nothing"
+  if inns timeout 3 bash -c "exec 3<>/dev/tcp/$NAS_VIP/$DOCKER_LOOPBACK_PORT" 2>/dev/null; then
+    fail "port $DOCKER_LOOPBACK_PORT, published on 127.0.0.1 only, is reachable over the tunnel"
   fi
+  ok "port $DOCKER_LOOPBACK_PORT (127.0.0.1 only) is not reachable over the tunnel"
 fi
 
 # 6. the NAS forwards nothing. Asserted on the kernel's decision, not on a
 #    ping (a router with no route back would stay silent either way).
-route_out=$(ip route get "$GW" from "$CLIENT_VIP" iif nimo0 2>&1) && route_rc=0 || route_rc=$?
-echo "info: ip route get $GW from $CLIENT_VIP iif nimo0 (exit $route_rc): $route_out"
-if [ "$route_rc" = 0 ]; then
-  [[ $route_out == *prohibit* || $route_out == *unreachable* ]] || fail "the kernel would forward $CLIENT_VIP -> $GW from nimo0"
-  echo "info: refused by a prohibit/unreachable route"
-elif [[ $route_out == *"Permission denied"* ]]; then
-  echo "info: refused: Permission denied (the prohibit rule)"
-elif [[ $route_out == *"No route to host"* ]]; then
-  echo "info: refused: No route to host (the prohibit rule seen through forwarding=0)"
-else
-  fail "route lookup failed for another reason than a refusal: $route_out"
-fi
+refused() { # $1: a destination that is not the NAS itself
+  local out rc
+  out=$(ip route get "$1" from "$CLIENT_VIP" iif nimo0 2>&1) && rc=0 || rc=$?
+  echo "info: ip route get $1 from $CLIENT_VIP iif nimo0 (exit $rc): $out"
+  if [ "$rc" = 0 ]; then
+    [[ $out == *prohibit* || $out == *unreachable* ]] || fail "the kernel would forward $CLIENT_VIP -> $1 from nimo0"
+    echo "info: refused by a prohibit/unreachable route"
+  elif [[ $out == *"Permission denied"* ]]; then
+    echo "info: refused: Permission denied (the prohibit rule)"
+  elif [[ $out == *"No route to host"* ]]; then
+    echo "info: refused: No route to host (the prohibit rule seen through forwarding=0)"
+  else
+    fail "route lookup failed for another reason than a refusal: $out"
+  fi
+}
+refused "$GW"
+# a container's own address is behind the NAS just like the home network
+[ -z "${DOCKER_CONTAINER_IP:-}" ] || refused "$DOCKER_CONTAINER_IP"
 [ "$(cat /proc/sys/net/ipv4/conf/nimo0/forwarding)" = 0 ] || fail "IPv4 forwarding is on for nimo0"
 rules=$(ip -4 rule show)
 grep -Eq '^5200:.*iif nimo0.*prohibit' <<<"$rules" || fail "no 'iif nimo0 prohibit' rule at priority 5200:
