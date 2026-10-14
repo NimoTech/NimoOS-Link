@@ -178,6 +178,41 @@ refused() { # $1: a destination that is not the NAS itself
 refused "$GW"
 # a container's own address is behind the NAS just like the home network
 [ -z "${DOCKER_CONTAINER_IP:-}" ] || refused "$DOCKER_CONTAINER_IP"
+
+# 6b. and nothing but the NAS itself reaches the client: what a machine at
+#     home or a container sends to the virtual network is not passed on.
+not_passed_on() { # $1: where it comes from, $2: the interface it arrives on
+  local out rc
+  out=$(ip route get "$CLIENT_VIP" from "$1" iif "$2" 2>&1) && rc=0 || rc=$?
+  echo "info: ip route get $CLIENT_VIP from $1 iif $2 (exit $rc): $out"
+  if [ "$rc" = 0 ]; then
+    [[ $out == *prohibit* || $out == *unreachable* ]] || fail "the kernel would forward $1 -> $CLIENT_VIP into the tunnel"
+  elif [[ $out != *"Permission denied"* && $out != *"No route to host"* ]]; then
+    fail "route lookup failed for another reason than a refusal: $out"
+  fi
+}
+GW_IF=$(ip route show default | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+[ -n "$GW_IF" ] || fail "no default route interface"
+not_passed_on "$GW" "$GW_IF"
+if [ -n "${DOCKER_CONTAINER_IP:-}" ]; then
+  BR_IF=$(ip route get "$DOCKER_CONTAINER_IP" | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  [ -n "$BR_IF" ] || fail "no interface leads to $DOCKER_CONTAINER_IP"
+  not_passed_on "$DOCKER_CONTAINER_IP" "$BR_IF"
+fi
+own=$(ip route get "$CLIENT_VIP" 2>&1) || fail "the NAS itself has no route to the client: $own"
+[[ $own == *"dev nimo0"* ]] || fail "the NAS's own route to the client is not the tunnel: $own"
+ping -c 2 -W 2 "$CLIENT_VIP" >/dev/null 2>&1 || fail "the NAS itself cannot reach the client through the tunnel"
+rules=$(ip -4 rule show)
+grep -Eq '^5201:.*to [0-9./]+ iif lo lookup 5201' <<<"$rules" && grep -Eq '^5202:.*to [0-9./]+ prohibit' <<<"$rules" || fail "the rules at priority 5201/5202 are missing:
+$rules"
+# the way to the clients is in the NAS's own table only: no rule of anybody
+# else's can find it in the main table, whatever its priority
+main_routes=$(ip -4 route show table main)
+[[ $main_routes != *nimo0* ]] || fail "the main table has a route through nimo0:
+$main_routes"
+own_table=$(ip -4 route show table 5201 2>/dev/null || true)
+[[ $own_table == *"dev nimo0"* ]] || fail "table 5201 has no route through nimo0: $own_table"
+ok "only the NAS reaches the client: the home network and containers are refused, the NAS's own ping is answered"
 [ "$(cat /proc/sys/net/ipv4/conf/nimo0/forwarding)" = 0 ] || fail "IPv4 forwarding is on for nimo0"
 rules=$(ip -4 rule show)
 grep -Eq '^5200:.*iif nimo0.*prohibit' <<<"$rules" || fail "no 'iif nimo0 prohibit' rule at priority 5200:
