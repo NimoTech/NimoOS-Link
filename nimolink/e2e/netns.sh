@@ -17,7 +17,8 @@ set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 
 NS=nlc HOST_IF=nlc-host HOST_IP=10.199.0.1 NS_IP=10.199.0.2
-WORK="" DEVICE_ID="" TOKEN="" REVOKED=0 MADE_NS=0 MADE_LINK=0 CLIENT_STARTED=0
+WORK="" DEVICE_ID="" TOKEN="" REVOKED=0 MADE_NS=0 MADE_LINK=0 CLIENT_STARTED=0 MADE_HOME=0
+GW_INI=/etc/nimoos/gateway.ini
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "ok: $*"; }
 inns() { ip netns exec "$NS" "$@"; }
@@ -85,7 +86,20 @@ cleanup() {
       if [ -e "$f" ]; then rm -f "$f"; echo "removed leftover $f"; fi
     done
   fi
-  [ -z "$WORK" ] || rm -rf "$WORK"
+  if [ "$MADE_HOME" = 1 ] && [ -f "$WORK/gateway.ini.orig" ]; then
+    if cp -p "$WORK/gateway.ini.orig" "$GW_INI" && systemctl restart nimoos-gateway; then
+      echo "restored $GW_INI and restarted the Gateway"
+    else
+      echo "NOTE: restore $GW_INI from $WORK/gateway.ini.orig and restart nimoos-gateway" >&2
+    fi
+  fi
+  if [ -n "$WORK" ]; then
+    if [ "$MADE_HOME" = 1 ] && ! cmp -s "$WORK/gateway.ini.orig" "$GW_INI"; then
+      echo "kept $WORK (it holds the original gateway.ini)" >&2
+    else
+      rm -rf "$WORK"
+    fi
+  fi
 }
 trap cleanup EXIT
 
@@ -95,6 +109,53 @@ ip link set nlc-ns netns "$NS"
 ip addr add "$HOST_IP/24" dev "$HOST_IF" && ip link set "$HOST_IF" up
 inns ip addr add "$NS_IP/24" dev nlc-ns
 inns ip link set nlc-ns up && inns ip link set lo up
+
+# The test's home network is a veth pair, which the Gateway does not count as
+# a home interface. For the run it is added to home_interfaces: to the list
+# already configured, or else to what the Gateway detects on its own (NICs,
+# bridges with a NIC port, bonds and VLANs on NICs). The file is restored and
+# the Gateway restarted on exit.
+[ -f "$GW_INI" ] || fail "$GW_INI not found"
+cp -p "$GW_INI" "$WORK/gateway.ini.orig"; MADE_HOME=1
+homes=$(python3 - "$GW_INI" "$HOST_IF" <<'PY'
+import os, re, sys
+path, test_if = sys.argv[1], sys.argv[2]
+text = open(path).read()
+
+def section(name):
+    m = re.search(r'(?ms)^\[' + name + r'\]\s*$(.*?)(?=^\[|\Z)', text)
+    return m.group(1) if m else ''
+
+def hardware(name, depth=0):  # as the Gateway's pkg/source hardware()
+    d = '/sys/class/net/' + name
+    if depth > 4 or not os.path.isdir(d):
+        return False
+    if os.path.exists(d + '/device'):
+        return True
+    for e in os.listdir(d):
+        if e.startswith('lower_') and hardware(e[len('lower_'):], depth + 1):
+            return True
+    brif = d + '/brif'
+    return os.path.isdir(brif) and any(hardware(p, depth + 1) for p in os.listdir(brif))
+
+m = re.search(r'(?m)^\s*home_interfaces\s*=\s*(.*)$', section('gateway'))
+configured = [n.strip() for n in (m.group(1) if m else '').split(',') if n.strip()]
+names = configured or sorted(n for n in os.listdir('/sys/class/net') if hardware(n))
+homes = ','.join([test_if] + [n for n in names if n != test_if])
+
+text = re.sub(r'(?m)^\s*home_interfaces\s*=.*\n?', '', text)
+if re.search(r'(?m)^\[gateway\]\s*$', text):
+    text = re.sub(r'(?m)^\[gateway\]\s*$', '[gateway]\nhome_interfaces=' + homes, text, count=1)
+else:
+    text += '\n[gateway]\nhome_interfaces=' + homes + '\n'
+open(path, 'w').write(text)
+print(homes)
+PY
+) || fail "could not set home_interfaces in $GW_INI"
+systemctl restart nimoos-gateway
+for i in $(seq 1 40); do curl -s -m 2 -o /dev/null "http://$HOST_IP/v1/gateway/device-info" && break; sleep 0.5; done
+sleep 3 # the tunnel comes up on the first sweep
+ok "home_interfaces for the run: $homes"
 
 # 1. pair over the "home network" link
 inns "$BIN" pair "$HOST_IP" -user "$NAS_USER" -name "e2e-netns" || fail "pairing (if the NAS did accept it, a device named e2e-netns may be on the account: remove it in the panel)"
@@ -134,6 +195,12 @@ code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' -X PUT -H @"$AUTH" -H 'C
 code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST -H @"$AUTH" -H 'Content-Type: application/json' -d '{"public_key":"x"}' "http://$NAS_VIP/v1/gateway/direct/pair")
 [ "$code" = 403 ] || fail "pairing over the tunnel: HTTP $code, want 403"
 ok "vpn label: enroll-code, the remote access switch and pairing are refused over the tunnel"
+
+# 4b. this machine itself is not the home network any more: what a tunnel
+#     client on the NAS would send is refused like the internet
+code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST -H @"$AUTH" "http://127.0.0.1/v1/users/remote/enroll-code")
+[ "$code" = 403 ] || fail "enroll-code from this machine (loopback): HTTP $code, want 403. If the NAS accepted it, an enrol code may have been issued: check the panel"
+ok "local label: enroll-code from this machine is refused"
 
 # 5. another port of the NAS (ssh), if it listens
 listening=$(ss -ltn)
