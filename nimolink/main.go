@@ -119,7 +119,8 @@ func cmdPair(args []string, trace io.Writer) error {
 	}
 	c := Config{NAS: base, Username: *user, DeviceID: res.DeviceID, DeviceToken: res.DeviceToken, PrivateKey: priv,
 		NASPublicKey: res.NASPublicKey, NASAddress: res.NASAddress, ClientAddress: res.ClientAddress, Subnet: res.Subnet,
-		Port: res.Port, Endpoints: res.Endpoints, RemoteURL: res.RemoteURL, Keepalive: res.Keepalive, MTU: res.MTU}
+		Port: res.Port, Endpoints: res.Endpoints, RemoteURL: res.RemoteURL, Keepalive: res.Keepalive, MTU: res.MTU,
+		STUNServer: res.STUNServer}
 	if err := savePairing(api, token, c); err != nil {
 		return err
 	}
@@ -161,7 +162,9 @@ func cmdUp(args []string, trace io.Writer) error {
 	if err != nil {
 		return err
 	}
-	ep, err := chooseEndpoint(c, *endpoint)
+	// No usable pairing endpoint is fine when the NAS has a remote address:
+	// connect finds the way.
+	ep, forced, err := initialEndpoint(c, *endpoint, udpResolves)
 	if err != nil {
 		return err
 	}
@@ -169,7 +172,7 @@ func cmdUp(args []string, trace io.Writer) error {
 	if *extra != "" {
 		extras = strings.Split(*extra, ",")
 	}
-	return runUp(c, ep, extras, trace)
+	return runUp(c, ep, forced, extras, trace)
 }
 
 func main() {

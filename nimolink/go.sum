@@ -1,3 +1,5 @@
+github.com/NimoTech/NimoOS-Link v0.1.0-alpha3 h1:iuHV5lMqJh8RdQIebzEcvSY7bqUBMntBRL+/ke4jNDo=
+github.com/NimoTech/NimoOS-Link v0.1.0-alpha3/go.mod h1:8s1CYNkUKNvoPfOLrKwc3e205S5E5kBdktN5mnGDSSg=
 github.com/google/btree v1.1.2 h1:xf4v41cLI2Z6FxbKm+8Bu+m8ifhj15JuZ9sa0jZCMUU=
 github.com/google/btree v1.1.2/go.mod h1:qOPhT0dTNdNzV6Z/lhRX0YXUafgPLFUh+gZMl761Gm4=
 golang.org/x/crypto v0.37.0 h1:kJNSjF/Xp7kU0iB2Z+9viTPMW4EqqsrywMXLJOOsXSE=

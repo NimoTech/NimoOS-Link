@@ -55,3 +55,5 @@ A device that is already paired is not paired twice: `pair` refuses, and `sudo .
 Run every command with sudo: the tunnel belongs to root, and the configuration lives in root's config directory unless `NIMOLINK_CONFIG` names another.
 
 It is its own Go module and needs Go 1.23.1 or newer (the library needs only Go 1.21).
+
+Away from home, `up` finds a direct path to the NAS through both NATs (STUN plus hole punching); `nimolink/PROTOCOL.md` describes that exchange for anyone writing another client.

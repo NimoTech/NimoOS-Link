@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/NimoTech/NimoOS-Link/nimolink/direct"
 )
 
 func TestNormalizeBase(t *testing.T) {
@@ -220,5 +223,105 @@ func TestSavePairingRevokesOnFailure(t *testing.T) {
 	err = savePairing(a, "ACCESS", c)
 	if err == nil || !strings.Contains(err.Error(), "7") || !strings.Contains(err.Error(), "panel") {
 		t.Fatalf("a failed removal must name the device and the panel: %v", err)
+	}
+}
+func TestConnect(t *testing.T) {
+	var gotHdr, gotAuth string
+	var gotBody map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/gateway/direct/connect" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		gotHdr, gotAuth = r.Header.Get("X-NimoLink-Device"), r.Header.Get("Authorization")
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Write([]byte(`{"success":200,"message":"ok","data":{"session":"s","check_key":"a2V5","expires_in":60,"nas_public_key":"pk","candidates":[{"type":"stun","addr":"203.0.113.7:51446"}]}}`))
+	}))
+	defer srv.Close()
+	api := &API{Base: srv.URL, HTTP: srv.Client()}
+	res, err := api.Connect("devtok", []direct.Candidate{{Type: "lan", Addr: "192.168.43.5:40000"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHdr != "devtok" || gotAuth != "" {
+		t.Fatalf("headers: device=%q authorization=%q", gotHdr, gotAuth)
+	}
+	if res.Session != "s" || res.CheckKey != "a2V5" || len(res.Candidates) != 1 || res.Candidates[0].Addr != "203.0.113.7:51446" {
+		t.Fatalf("%+v", res)
+	}
+	if c, _ := gotBody["candidates"].([]interface{}); len(c) != 1 {
+		t.Fatalf("body %v", gotBody)
+	}
+}
+
+func TestConnectErrors(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		body   string
+		want   error
+	}{
+		{404, "404 page not found", ErrNoConnect},
+		{404, `{"success":404,"message":"DIRECT_OFF"}`, ErrDirectOff},
+		{401, `{"success":401,"message":"TOKEN_INVALID"}`, ErrDeviceRemoved},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(c.status)
+			w.Write([]byte(c.body))
+		}))
+		_, err := (&API{Base: srv.URL, HTTP: srv.Client()}).Connect("t", nil)
+		srv.Close()
+		if !errors.Is(err, c.want) {
+			t.Errorf("%d %s: %v, want %v", c.status, c.body, err, c.want)
+		}
+	}
+}
+
+func TestTraceHidesTheCheckKey(t *testing.T) {
+	if v := redact(map[string]interface{}{"check_key": "secret"}); v.(map[string]interface{})["check_key"] == "secret" {
+		t.Fatal("check_key in the trace")
+	}
+}
+
+// What a NAS really answers through its remote address: the gate speaks first.
+func TestConnectErrorsFromTheGate(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		body   string
+		want   error
+	}{
+		{401, `{"code":"CLIENT_INVALID","message":"CLIENT_INVALID","success":401}`, ErrDeviceRemoved},
+		{403, `{"code":"REMOTE_AUTH_REQUIRED","message":"REMOTE_AUTH_REQUIRED","success":403}`, ErrNoConnect}, // an older NAS
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(c.status)
+			w.Write([]byte(c.body))
+		}))
+		_, err := (&API{Base: srv.URL, HTTP: srv.Client()}).Connect("t", nil)
+		srv.Close()
+		if !errors.Is(err, c.want) {
+			t.Errorf("%d %s: %v, want %v", c.status, c.body, err, c.want)
+		}
+	}
+}
+
+// The device credential never follows a redirect to another host.
+func TestConnectDoesNotFollowRedirects(t *testing.T) {
+	leaked := make(chan string, 1)
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked <- r.Header.Get("X-NimoLink-Device")
+	}))
+	defer other.Close()
+	nas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer nas.Close()
+	_, err := connectAPI(Config{RemoteURL: nas.URL}, nil).Connect("devtok", nil)
+	if err == nil {
+		t.Fatal("a redirect was taken for an answer")
+	}
+	select {
+	case h := <-leaked:
+		t.Fatalf("followed the redirect; the other host got %q", h)
+	default:
 	}
 }

@@ -181,6 +181,23 @@ code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$NAS_VIP/v1/gate
 [ "$code" = 200 ] || fail "panel over the tunnel: HTTP $code"
 ok "panel reachable over the tunnel"
 
+# 3b. connect over the tunnel answers with the NAS's home address; from the
+#     home network it is refused (pairing's endpoints serve there). The device
+#     credential goes to curl in a header file, never on a command line.
+python3 -c "import json,os;print('X-NimoLink-Device: '+json.load(open(os.environ['NIMOLINK_CONFIG']+'/config.json'))['device_token'])" >"$WORK/devhdr"
+chmod 600 "$WORK/devhdr"
+out=$(inns curl -s -m 10 -H @"$WORK/devhdr" -H 'Content-Type: application/json' -d '{"candidates":[]}' "http://$NAS_VIP/v1/gateway/direct/connect")
+echo "$out" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)['data']
+assert d['session'] and d['check_key'], d
+assert any(c['type']=='lan' and c['addr']=='$HOST_IP:51900' for c in d['candidates']), d['candidates']
+" || fail "connect over the tunnel: $out"
+code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' -H @"$WORK/devhdr" -H 'Content-Type: application/json' -d '{"candidates":[]}' "http://$HOST_IP/v1/gateway/direct/connect")
+[ "$code" = 403 ] || fail "connect from the home network: HTTP $code, want 403"
+inns "$BIN" status | grep -q "^path: " || fail "status does not show the path"
+ok "connect: over the tunnel it answers with the home address; from the home network it is refused"
+
 # 4. requests over the tunnel are labelled vpn: what is for the home network only is refused
 # The login body is built from the environment and goes to curl on stdin.
 TOKEN=$(python3 -c 'import json,os;print(json.dumps({"username":os.environ["NAS_USER"],"password":os.environ["NIMOLINK_PASSWORD"]}))' \

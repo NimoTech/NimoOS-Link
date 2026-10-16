@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -28,6 +30,7 @@ type Config struct {
 	RemoteURL     string   `json:"remote_url"`
 	Keepalive     int      `json:"keepalive"`
 	MTU           int      `json:"mtu"`
+	STUNServer    string   `json:"stun_server,omitempty"`
 }
 
 // configDirE is where the configuration lives: NIMOLINK_CONFIG, else the
@@ -194,4 +197,18 @@ func (c Config) save() (err error) {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(dir, "config.json"))
+}
+
+// stunServerFor: what pairing said, else the remote address's host on 3478
+// (the relay's wildcard name points at the relay host). Pairings from step 1
+// have no stun_server and need no new pairing.
+func stunServerFor(c Config) string {
+	if c.STUNServer != "" {
+		return c.STUNServer
+	}
+	u, err := url.Parse(c.RemoteURL)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	return net.JoinHostPort(u.Hostname(), "3478")
 }

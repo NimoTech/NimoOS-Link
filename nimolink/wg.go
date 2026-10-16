@@ -103,12 +103,15 @@ func uapiConfig(c Config, endpoint string, extraAllowed []string) (string, error
 	if _, _, err := net.ParseCIDR(c.Subnet); err != nil {
 		return "", errors.New("the stored network is unusable: pair again")
 	}
-	// wireguard-go takes an address, not a name: resolve it here.
-	addr, err := net.ResolveUDPAddr("udp", endpoint)
-	if err != nil {
-		return "", fmt.Errorf("%q is not an endpoint (host:port)", endpoint)
+	// wireguard-go takes an address, not a name: resolve it here. No
+	// endpoint yet is fine: connect finds one.
+	if endpoint != "" {
+		addr, err := net.ResolveUDPAddr("udp", endpoint)
+		if err != nil {
+			return "", fmt.Errorf("%q is not an endpoint (host:port)", endpoint)
+		}
+		endpoint = addr.String()
 	}
-	endpoint = addr.String()
 	if err := validatePairing(c); err != nil {
 		return "", err
 	}
@@ -117,8 +120,11 @@ func uapiConfig(c Config, endpoint string, extraAllowed []string) (string, error
 		keepalive = 25
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "private_key=%s\nreplace_peers=true\npublic_key=%s\nendpoint=%s\npersistent_keepalive_interval=%d\nreplace_allowed_ips=true\nallowed_ip=%s\n",
-		priv, pub, endpoint, keepalive, c.Subnet)
+	fmt.Fprintf(&b, "private_key=%s\nreplace_peers=true\npublic_key=%s\n", priv, pub)
+	if endpoint != "" {
+		fmt.Fprintf(&b, "endpoint=%s\n", endpoint)
+	}
+	fmt.Fprintf(&b, "persistent_keepalive_interval=%d\nreplace_allowed_ips=true\nallowed_ip=%s\n", keepalive, c.Subnet)
 	for _, extra := range extraAllowed {
 		if _, _, err := net.ParseCIDR(extra); err != nil {
 			return "", fmt.Errorf("%q is not a network", extra)
@@ -236,4 +242,10 @@ func writePidFile(path string, pid int) (err error) {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// endpointConfig points the NAS peer at endpoint (a resolved host:port).
+func endpointConfig(c Config, endpoint string) string {
+	pub, _ := hexKey(c.NASPublicKey)
+	return fmt.Sprintf("public_key=%s\nupdate_only=true\nendpoint=%s\n", pub, endpoint)
 }

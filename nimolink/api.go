@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/NimoTech/NimoOS-Link/nimolink/direct"
 )
 
 // API talks to the NAS's panel address.
@@ -32,6 +34,7 @@ type PairResult struct {
 	RemoteURL     string   `json:"remote_url"`
 	Keepalive     int      `json:"keepalive"`
 	MTU           int      `json:"mtu"`
+	STUNServer    string   `json:"stun_server"`
 }
 
 // newHTTPClient returns the client used against the NAS. It never follows a
@@ -65,7 +68,7 @@ func normalizeBase(s string) (string, error) {
 }
 
 // secretFields never appear in a trace.
-var secretFields = map[string]bool{"password": true, "access_token": true, "refresh_token": true, "device_token": true, "token": true, "challenge": true}
+var secretFields = map[string]bool{"password": true, "access_token": true, "refresh_token": true, "device_token": true, "token": true, "challenge": true, "check_key": true}
 
 func redact(v interface{}) interface{} {
 	switch x := v.(type) {
@@ -113,6 +116,15 @@ func (a *API) post(path, authorization string, body interface{}) (int, []byte, e
 }
 
 func (a *API) do(method, path, authorization string, body interface{}) (int, []byte, error) {
+	var hdr map[string]string
+	if authorization != "" {
+		hdr = map[string]string{"Authorization": authorization}
+	}
+	return a.doWith(method, path, hdr, body)
+}
+
+// doWith sends a request with extra headers (never traced: they carry credentials).
+func (a *API) doWith(method, path string, hdr map[string]string, body interface{}) (int, []byte, error) {
 	var raw []byte
 	var rd io.Reader
 	if body != nil {
@@ -126,8 +138,8 @@ func (a *API) do(method, path, authorization string, body interface{}) (int, []b
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if authorization != "" {
-		req.Header.Set("Authorization", authorization)
+	for k, v := range hdr {
+		req.Header.Set(k, v)
 	}
 	a.trace("> %s %s", method, path)
 	if body != nil {
@@ -225,4 +237,57 @@ func (a *API) RevokeDevice(token string, id int) error {
 		return fmt.Errorf("the NAS answered HTTP %d", status)
 	}
 	return nil
+}
+
+var (
+	ErrNoConnect     = errors.New("this NAS does not offer direct connections from outside yet (older NimoOS)")
+	ErrDirectOff     = errors.New("remote access or direct connection is off on the NAS")
+	ErrDeviceRemoved = errors.New("this device was removed from the NAS: pair it again at home")
+)
+
+type ConnectResult struct {
+	Session      string             `json:"session"`
+	CheckKey     string             `json:"check_key"`
+	ExpiresIn    int                `json:"expires_in"`
+	NASPublicKey string             `json:"nas_public_key"`
+	Candidates   []direct.Candidate `json:"candidates"`
+}
+
+// Connect asks the NAS (through its remote address) for a session and its
+// addresses, offering ours. The device credential goes in X-NimoLink-Device.
+func (a *API) Connect(deviceToken string, cands []direct.Candidate) (ConnectResult, error) {
+	if cands == nil {
+		cands = []direct.Candidate{}
+	}
+	status, body, err := a.doWith(http.MethodPost, "/v1/gateway/direct/connect",
+		map[string]string{"X-NimoLink-Device": deviceToken}, map[string]interface{}{"candidates": cands})
+	if err != nil {
+		return ConnectResult{}, err
+	}
+	var env struct {
+		Message string        `json:"message"`
+		Data    ConnectResult `json:"data"`
+	}
+	jsonErr := json.Unmarshal(body, &env)
+	switch {
+	case status == http.StatusOK && jsonErr == nil:
+		return env.Data, nil
+	case status == http.StatusNotFound && env.Message == "DIRECT_OFF":
+		return ConnectResult{}, ErrDirectOff
+	case status == http.StatusNotFound:
+		return ConnectResult{}, ErrNoConnect
+	// an older NAS: its gate does not know the device header
+	case status == http.StatusForbidden && env.Message == "REMOTE_AUTH_REQUIRED":
+		return ConnectResult{}, ErrNoConnect
+	// the gate (CLIENT_INVALID) or the handler (TOKEN_INVALID): removed
+	case status == http.StatusUnauthorized:
+		return ConnectResult{}, ErrDeviceRemoved
+	}
+	return ConnectResult{}, fmt.Errorf("connect: the NAS answered HTTP %d %s", status, env.Message)
+}
+
+// connectAPI talks to the NAS through its remote address.
+func connectAPI(c Config, trace io.Writer) *API {
+	// newHTTPClient refuses redirects: the device credential never follows one.
+	return &API{Base: strings.TrimRight(c.RemoteURL, "/"), HTTP: newHTTPClient(), Trace: trace}
 }

@@ -179,3 +179,17 @@ func TestWritePidFile(t *testing.T) {
 		t.Fatal("a write failure was not reported")
 	}
 }
+func TestSTUNServerFor(t *testing.T) {
+	for _, c := range []struct {
+		cfg  Config
+		want string
+	}{
+		{Config{STUNServer: "stun.example:3479", RemoteURL: "https://abc.relay-test.nimotech.ai"}, "stun.example:3479"},
+		{Config{RemoteURL: "https://abc.relay-test.nimotech.ai"}, "abc.relay-test.nimotech.ai:3478"},
+		{Config{}, ""},
+	} {
+		if got := stunServerFor(c.cfg); got != c.want {
+			t.Errorf("%+v: %q want %q", c.cfg, got, c.want)
+		}
+	}
+}

@@ -3,6 +3,7 @@ module github.com/NimoTech/NimoOS-Link/nimolink
 go 1.23.1
 
 require (
+	github.com/NimoTech/NimoOS-Link v0.1.0-alpha3
 	golang.org/x/crypto v0.37.0
 	golang.org/x/term v0.31.0
 	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
