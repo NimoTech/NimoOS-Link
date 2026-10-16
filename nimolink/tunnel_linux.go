@@ -5,7 +5,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -346,13 +345,9 @@ func findPath(ctx context.Context, c Config, api *API, agent *direct.Agent, port
 			cancel()
 		}
 	}
-	res, err := api.Connect(c.DeviceToken, cands)
+	res, key, err := openSession(api, c, cands)
 	if err != nil {
 		return Path{}, false, err
-	}
-	key, err := base64.RawURLEncoding.DecodeString(res.CheckKey)
-	if err != nil || len(key) == 0 {
-		return Path{}, false, errors.New("connect: unusable check key")
 	}
 	agent.SetSession(res.Session, key)
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)

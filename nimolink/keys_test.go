@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"testing"
 )
 
@@ -32,6 +33,24 @@ func TestKeyPair(t *testing.T) {
 	for _, bad := range []string{"", "short", pub[:43], pub + "A"} {
 		if _, err := hexKey(bad); err == nil {
 			t.Errorf("hexKey(%q) accepted", bad)
+		}
+	}
+}
+
+func TestCheckNASKey(t *testing.T) {
+	stored := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	other := make([]byte, 32)
+	other[0] = 1
+	if err := checkNASKey(stored, stored); err != nil {
+		t.Fatalf("same key: %v", err)
+	}
+	for name, got := range map[string]string{
+		"another NAS": base64.StdEncoding.EncodeToString(other),
+		"missing":     "",
+		"not a key":   "pk",
+	} {
+		if err := checkNASKey(stored, got); !errors.Is(err, ErrNASKeyChanged) {
+			t.Errorf("%s: %v, want ErrNASKeyChanged", name, err)
 		}
 	}
 }

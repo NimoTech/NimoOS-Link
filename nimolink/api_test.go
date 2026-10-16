@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -323,5 +324,27 @@ func TestConnectDoesNotFollowRedirects(t *testing.T) {
 	case h := <-leaked:
 		t.Fatalf("followed the redirect; the other host got %q", h)
 	default:
+	}
+}
+
+func TestOpenSessionChecksTheNASKey(t *testing.T) {
+	paired := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	other := make([]byte, 32)
+	other[0] = 1
+	answer := func(key string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"success":200,"message":"ok","data":{"session":"s","check_key":"a2V5","expires_in":60,"nas_public_key":"` + key + `","candidates":[]}}`))
+		}))
+	}
+	srv := answer(paired)
+	defer srv.Close()
+	res, key, err := openSession(&API{Base: srv.URL, HTTP: srv.Client()}, Config{DeviceToken: "t", NASPublicKey: paired}, nil)
+	if err != nil || res.Session != "s" || string(key) != "key" {
+		t.Fatalf("paired NAS: %+v %q %v", res, key, err)
+	}
+	srv2 := answer(base64.StdEncoding.EncodeToString(other))
+	defer srv2.Close()
+	if _, _, err := openSession(&API{Base: srv2.URL, HTTP: srv2.Client()}, Config{DeviceToken: "t", NASPublicKey: paired}, nil); !errors.Is(err, ErrNASKeyChanged) {
+		t.Fatalf("another NAS: %v, want ErrNASKeyChanged", err)
 	}
 }

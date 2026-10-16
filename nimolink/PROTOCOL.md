@@ -64,7 +64,8 @@ Answer `200`:
 
 The NAS asks the relay's STUN service again before it answers (up to 1.5 s),
 so the `stun` candidate is its mapping of now. Check that `nas_public_key` is
-the key pairing saved. `check_key` is a secret: never log it.
+the key pairing saved, and drop the whole answer if it is not: it came from
+another machine. `check_key` is a secret: never log it.
 
 Errors (body `{"success": <HTTP status>, "message": "<CODE>"}`):
 

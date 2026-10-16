@@ -32,3 +32,18 @@ func hexKey(b64 string) (string, error) {
 	}
 	return hex.EncodeToString(b), nil
 }
+
+var ErrNASKeyChanged = errors.New("connect: the NAS answered with another key than the one paired (reinstalled NAS, or the remote address leads elsewhere): pair again at home")
+
+// checkNASKey refuses a connect answer whose NAS key is not the stored one:
+// its session and addresses would come from some other machine.
+func checkNASKey(stored, got string) error {
+	want, err := hexKey(stored)
+	if err != nil {
+		return ErrNASKeyChanged
+	}
+	if have, err := hexKey(got); err != nil || have != want {
+		return ErrNASKeyChanged
+	}
+	return nil
+}

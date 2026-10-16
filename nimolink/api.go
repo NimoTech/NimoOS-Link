@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -290,4 +291,21 @@ func (a *API) Connect(deviceToken string, cands []direct.Candidate) (ConnectResu
 func connectAPI(c Config, trace io.Writer) *API {
 	// newHTTPClient refuses redirects: the device credential never follows one.
 	return &API{Base: strings.TrimRight(c.RemoteURL, "/"), HTTP: newHTTPClient(), Trace: trace}
+}
+
+// openSession calls connect and accepts the answer only from the paired NAS
+// (its key) with a usable check key, which it returns decoded.
+func openSession(api *API, c Config, cands []direct.Candidate) (ConnectResult, []byte, error) {
+	res, err := api.Connect(c.DeviceToken, cands)
+	if err != nil {
+		return ConnectResult{}, nil, err
+	}
+	if err := checkNASKey(c.NASPublicKey, res.NASPublicKey); err != nil {
+		return ConnectResult{}, nil, err
+	}
+	key, err := base64.RawURLEncoding.DecodeString(res.CheckKey)
+	if err != nil || len(key) == 0 {
+		return ConnectResult{}, nil, errors.New("connect: unusable check key")
+	}
+	return res, key, nil
 }

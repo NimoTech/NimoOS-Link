@@ -196,6 +196,7 @@ assert any(c['type']=='lan' and c['addr']=='$HOST_IP:51900' for c in d['candidat
 code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' -H @"$WORK/devhdr" -H 'Content-Type: application/json' -d '{"candidates":[]}' "http://$HOST_IP/v1/gateway/direct/connect")
 [ "$code" = 403 ] || fail "connect from the home network: HTTP $code, want 403"
 inns "$BIN" status | grep -q "^path: " || fail "status does not show the path"
+! grep -q "another key than the one paired" "$NIMOLINK_CONFIG/up.log" || fail "the client refused the NAS's connect answer: $(cat "$NIMOLINK_CONFIG/up.log")"
 ok "connect: over the tunnel it answers with the home address; from the home network it is refused"
 
 # 4. requests over the tunnel are labelled vpn: what is for the home network only is refused
