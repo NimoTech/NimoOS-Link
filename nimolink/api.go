@@ -220,9 +220,11 @@ func (a *API) Pair(token, pub, name, platform string) (PairResult, error) {
 		}
 		return PairResult{}, fmt.Errorf("pairing failed: %s (HTTP %d)", out.Message, status)
 	}
+	// Whether the rest is usable is for validatePairing, in savePairing: a
+	// device the NAS registered must be removed again when it is not.
 	r := out.Data
-	if r.DeviceToken == "" || r.NASPublicKey == "" || r.NASAddress == "" || r.ClientAddress == "" || r.Subnet == "" || r.Port == 0 {
-		return PairResult{}, errors.New("the NAS answered, but not with what a tunnel needs")
+	if r.DeviceID <= 0 {
+		return PairResult{}, errors.New("the NAS answered, but registered no device")
 	}
 	return r, nil
 }

@@ -131,23 +131,14 @@ func runUp(c Config, endpoint string, forced bool, mode string, extraAllowed []s
 	}
 
 	fmt.Printf("tunnel up: this device is %s, the NAS is %s (via %s)\n", c.ClientAddress, c.NASAddress, via)
-	go func() {
-		// Say plainly whether the NAS answered; do not leave the user guessing.
-		wait := 10 * time.Second
-		if endpoint == "" || (!forced && c.RemoteURL != "") {
-			wait = 25 * time.Second // connect, or the relay, may have to find the way first
-		}
-		deadline := time.Now().Add(wait)
-		for time.Now().Before(deadline) {
-			if get, err := dev.IpcGet(); err == nil && !parseStatus(get).LastHandshake.IsZero() {
-				fmt.Printf("connected: open http://%s/\n", c.NASAddress)
-				return
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
+	wait := 10 * time.Second
+	if endpoint == "" || (!forced && c.RemoteURL != "") {
+		wait = 25 * time.Second // connect, or the relay, may have to find the way first
+	}
+	go reportHandshake(os.Stdout, c.NASAddress, wait, 500*time.Millisecond, func() TunnelStatus {
 		get, _ := dev.IpcGet()
-		fmt.Println(statusLine(parseStatus(get), time.Now()))
-	}()
+		return parseStatus(get)
+	}, dev.Wait())
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -294,14 +285,18 @@ func connectLoop(ctx context.Context, c Config, dev *device.Device, bind *direct
 	lastAddrs := addrSnapshot()
 	wasAlive := false
 	// A pairing endpoint gets a few seconds to answer before the relay: at
-	// home it does, and there the relay is not wanted.
+	// home it does, and there the relay is not wanted. Away from home the
+	// relay is dialed meanwhile, so that it is ready when they are up.
+	var early *earlyRelay[*fallbackConn]
 	if currentPath().Endpoint != "" && mode != "relay" {
-		for t := time.Now(); time.Since(t) < 5*time.Second && !handshakeFresh(dev, time.Minute); {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(250 * time.Millisecond):
-			}
+		dial := func(ctx context.Context) (*fallbackConn, error) { return dialFallback(ctx, c, trace) }
+		if mode == "direct" {
+			dial = nil
+		}
+		_, early = awaitPairing(ctx, 5*time.Second, time.Second, 250*time.Millisecond,
+			func() bool { return handshakeFresh(dev, time.Minute) }, dial)
+		if ctx.Err() != nil {
+			return
 		}
 	}
 
@@ -315,7 +310,8 @@ func connectLoop(ctx context.Context, c Config, dev *device.Device, bind *direct
 	}()
 	useRelay := func(fc *fallbackConn) {
 		bind.SetRelay(fc)
-		if err := dev.IpcSet(endpointConfig(c, direct.RelayEndpoint.String())); err != nil {
+		get, _ := dev.IpcGet()
+		if err := dev.IpcSet(freshPeerConfig(c, direct.RelayEndpoint.String(), allowedIPs(get))); err != nil {
 			bind.SetRelay(nil)
 			return
 		}
@@ -323,6 +319,7 @@ func connectLoop(ctx context.Context, c Config, dev *device.Device, bind *direct
 		setPath(Path{"relay", fc.host})
 		fmt.Printf("path: relay %s\n", fc.host)
 	}
+	var adopt func(time.Time, *fallbackConn, error) bool
 	// toRelay puts the tunnel on the relay: the connection kept from before,
 	// or a new one when one is due. false: up must end.
 	toRelay := func(now time.Time) bool {
@@ -334,6 +331,11 @@ func connectLoop(ctx context.Context, c Config, dev *device.Device, bind *direct
 			return true
 		}
 		fc, err := dialFallback(ctx, c, trace)
+		return adopt(now, fc, err)
+	}
+	// adopt takes a dial's result: the tunnel moves onto a new connection,
+	// a failure waits as relayState says. false: up must end.
+	adopt = func(now time.Time, fc *fallbackConn, err error) bool {
 		switch {
 		case ctx.Err() != nil:
 			return true
@@ -369,6 +371,10 @@ func connectLoop(ctx context.Context, c Config, dev *device.Device, bind *direct
 		return true
 	}
 
+	if early != nil && !adopt(time.Now(), early.conn, early.err) {
+		return
+	}
+
 	for {
 		now := time.Now()
 		cur := currentPath()
@@ -380,7 +386,10 @@ func connectLoop(ctx context.Context, c Config, dev *device.Device, bind *direct
 		died := wasAlive && !alive
 		wasAlive = alive
 
-		if mode != "direct" && (!alive || (mode == "relay" && !onRelay)) {
+		// Already on a live relay connection: nothing more to do here (the
+		// handshake may still be on its way).
+		onLiveRelay := onRelay && rs.conn != nil
+		if mode != "direct" && ((!alive && !onLiveRelay) || (mode == "relay" && !onRelay)) {
 			if !toRelay(now) {
 				return
 			}

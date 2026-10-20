@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -57,6 +58,12 @@ func validatePairing(c Config) error {
 	}
 	if c.Keepalive < 0 || c.Keepalive > 600 {
 		return bad("keepalive %d", c.Keepalive)
+	}
+	if c.DeviceToken == "" {
+		return bad("no device token")
+	}
+	if _, err := hexKey(c.NASPublicKey); err != nil {
+		return bad("the NAS's public key %q is not a WireGuard key", c.NASPublicKey)
 	}
 	return nil
 }
@@ -202,6 +209,37 @@ func statusLine(st TunnelStatus, now time.Time) string {
 		how, now.Sub(st.LastHandshake).Round(time.Second), st.Rx, st.Tx)
 }
 
+// reportHandshake says plainly whether the NAS answered, so the user is not
+// left guessing: "connected" on the first handshake within wait, else the
+// status line. A handshake that still comes later (over the relay, or on a
+// later direct attempt) is reported too, with how long it took. It returns
+// once it has said connected, or when done closes.
+func reportHandshake(out io.Writer, nas string, wait, poll time.Duration, status func() TunnelStatus, done <-chan struct{}) {
+	start := time.Now()
+	t := time.NewTicker(poll)
+	defer t.Stop()
+	late := false
+	for {
+		st := status()
+		switch {
+		case !st.LastHandshake.IsZero() && late:
+			fmt.Fprintf(out, "connected after %s: open http://%s/\n", time.Since(start).Round(time.Second), nas)
+			return
+		case !st.LastHandshake.IsZero():
+			fmt.Fprintf(out, "connected: open http://%s/\n", nas)
+			return
+		case !late && time.Since(start) >= wait:
+			fmt.Fprintln(out, statusLine(st, time.Now()))
+			late = true
+		}
+		select {
+		case <-done:
+			return
+		case <-t.C:
+		}
+	}
+}
+
 var (
 	errTunnelDown = errors.New("the tunnel is not up (start it with `nimolink up`)")
 	errNeedRoot   = errors.New("permission denied: the tunnel belongs to root, run this command with sudo")
@@ -251,6 +289,40 @@ func writePidFile(path string, pid int) (err error) {
 }
 
 // endpointConfig points the NAS peer at endpoint (a resolved host:port).
+// freshPeerConfig points the NAS peer at endpoint as a new peer: removed and
+// added again with the same allowed IPs. WireGuard sends a handshake at most
+// every 5 s per peer, so after a dead path one may have just gone out to
+// nowhere; a new peer has no such history and, its keepalive switched on,
+// shakes hands at once. Its session is lost, which costs nothing when the
+// old path is dead.
+func freshPeerConfig(c Config, endpoint string, allowed []string) string {
+	pub, _ := hexKey(c.NASPublicKey)
+	keepalive := c.Keepalive
+	if keepalive <= 0 {
+		keepalive = 25
+	}
+	if len(allowed) == 0 {
+		allowed = []string{c.Subnet}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "public_key=%s\nremove=true\npublic_key=%s\nendpoint=%s\npersistent_keepalive_interval=%d\n", pub, pub, endpoint, keepalive)
+	for _, a := range allowed {
+		fmt.Fprintf(&b, "allowed_ip=%s\n", a)
+	}
+	return b.String()
+}
+
+// allowedIPs reads the allowed IPs from wireguard-go's answer to "get=1".
+func allowedIPs(get string) []string {
+	var out []string
+	for _, line := range strings.Split(get, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "allowed_ip="); ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 func endpointConfig(c Config, endpoint string) string {
 	pub, _ := hexKey(c.NASPublicKey)
 	return fmt.Sprintf("public_key=%s\nupdate_only=true\nendpoint=%s\n", pub, endpoint)

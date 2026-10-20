@@ -14,7 +14,7 @@ func TestConfigRoundTrip(t *testing.T) {
 		t.Fatal("a config was loaded although none exists")
 	}
 	c := Config{NAS: "http://192.168.1.118", Username: "alice", DeviceID: 7, DeviceToken: "TOKEN", PrivateKey: "PRIV",
-		NASPublicKey: "PUB", NASAddress: "100.64.7.1", ClientAddress: "100.64.7.5", Subnet: "100.64.7.0/24",
+		NASPublicKey: "19HFkGHISHGYszxevfABq7d8R5v66VLu3OcJTG1q5Hs=", NASAddress: "100.64.7.1", ClientAddress: "100.64.7.5", Subnet: "100.64.7.0/24",
 		Port: 51900, Endpoints: []string{"192.168.1.118:51900"}, RemoteURL: "https://x.example.test", Keepalive: 25, MTU: 1280}
 	if err := c.save(); err != nil {
 		t.Fatal(err)

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -156,9 +157,9 @@ func TestDialFallbackChecksTheCertificate(t *testing.T) {
 
 func TestFallbackAddr(t *testing.T) {
 	for in, want := range map[string]string{
-		"https://5wmfzvxpsm.relay-test.nimotech.ai":       "5wmfzvxpsm.relay-test.nimotech.ai:443",
-		"https://5wmfzvxpsm.relay-test.nimotech.ai/":      "5wmfzvxpsm.relay-test.nimotech.ai:443",
-		"https://5wmfzvxpsm.relay-test.nimotech.ai:8443/": "5wmfzvxpsm.relay-test.nimotech.ai:8443",
+		"https://k7f3x2ab2m.relay-test.nimotech.ai":       "k7f3x2ab2m.relay-test.nimotech.ai:443",
+		"https://k7f3x2ab2m.relay-test.nimotech.ai/":      "k7f3x2ab2m.relay-test.nimotech.ai:443",
+		"https://k7f3x2ab2m.relay-test.nimotech.ai:8443/": "k7f3x2ab2m.relay-test.nimotech.ai:8443",
 	} {
 		if _, got, err := fallbackAddr(in); err != nil || got != want {
 			t.Errorf("%s: %q %v", in, got, err)
@@ -232,5 +233,109 @@ func TestPathModeFlag(t *testing.T) {
 		if checkPathMode(bad[0], bad[1]) == nil {
 			t.Errorf("%q %q accepted", bad[0], bad[1])
 		}
+	}
+}
+
+type fakeRelayConn struct{ closed atomic.Bool }
+
+func (f *fakeRelayConn) Close() error { f.closed.Store(true); return nil }
+
+func TestAwaitPairing(t *testing.T) {
+	const grace, dialAfter, poll = 200 * time.Millisecond, 50 * time.Millisecond, 5 * time.Millisecond
+	type dialed struct {
+		at   time.Duration
+		conn *fakeRelayConn
+	}
+	run := func(fresh func(time.Duration) bool, dialErr error) (bool, *earlyRelay[*fakeRelayConn], []dialed) {
+		var mu sync.Mutex
+		var calls []dialed
+		start := time.Now()
+		home, early := awaitPairing(context.Background(), grace, dialAfter, poll,
+			func() bool { return fresh(time.Since(start)) },
+			func(context.Context) (*fakeRelayConn, error) {
+				time.Sleep(30 * time.Millisecond) // the relay takes a while
+				c := &fakeRelayConn{}
+				mu.Lock()
+				calls = append(calls, dialed{time.Since(start), c})
+				mu.Unlock()
+				if dialErr != nil {
+					return nil, dialErr
+				}
+				return c, nil
+			})
+		time.Sleep(60 * time.Millisecond) // a connection closed in the background
+		mu.Lock()
+		defer mu.Unlock()
+		return home, early, calls
+	}
+
+	// at home: the endpoint answers at once, the relay is never dialed
+	home, early, calls := run(func(time.Duration) bool { return true }, nil)
+	if !home || early != nil || len(calls) != 0 {
+		t.Fatalf("at home at once: home %v, early %v, %d dials", home, early, len(calls))
+	}
+
+	// at home, but late: the early connection is closed, not handed back
+	home, early, calls = run(func(d time.Duration) bool { return d > 120*time.Millisecond }, nil)
+	if !home || early != nil || len(calls) != 1 || !calls[0].conn.closed.Load() {
+		t.Fatalf("at home late: home %v, early %v, calls %+v", home, early, calls)
+	}
+
+	// away: dialed once after dialAfter, during the grace, and handed back open
+	start := time.Now()
+	home, early, calls = run(func(time.Duration) bool { return false }, nil)
+	took := time.Since(start) - 60*time.Millisecond
+	if home || early == nil || early.err != nil || len(calls) != 1 || early.conn != calls[0].conn || early.conn.closed.Load() {
+		t.Fatalf("away: home %v, early %+v, calls %+v", home, early, calls)
+	}
+	if calls[0].at < dialAfter || calls[0].at > grace {
+		t.Fatalf("dialed at %s, want between %s and %s", calls[0].at, dialAfter, grace)
+	}
+	if took > grace+100*time.Millisecond {
+		t.Fatalf("the grace took %s: the dial was not overlapped with it", took)
+	}
+
+	// the endpoint answers while the relay is still being dialed after the
+	// grace: at home after all, that connection is closed
+	slow := func(context.Context) (*fakeRelayConn, error) {
+		time.Sleep(250 * time.Millisecond)
+		return &fakeRelayConn{}, nil
+	}
+	start = time.Now()
+	var late *fakeRelayConn
+	home, early = awaitPairing(context.Background(), grace, dialAfter, poll,
+		func() bool { return time.Since(start) > grace+50*time.Millisecond },
+		func(ctx context.Context) (*fakeRelayConn, error) { c, err := slow(ctx); late = c; return c, err })
+	if !home || early != nil || late == nil || !late.closed.Load() {
+		t.Fatalf("answered during the dial: home %v, early %+v, conn %+v", home, early, late)
+	}
+
+	// -path=direct: no dial at all, only the wait
+	home, early = awaitPairing[*fakeRelayConn](context.Background(), grace, dialAfter, poll, func() bool { return false }, nil)
+	if home || early != nil {
+		t.Fatalf("no dial: home %v, early %+v", home, early)
+	}
+
+	// away, the dial failed: the error comes back for the usual backoff
+	boom := errors.New("boom")
+	_, early, _ = run(func(time.Duration) bool { return false }, boom)
+	if early == nil || !errors.Is(early.err, boom) || early.conn != nil {
+		t.Fatalf("failed dial: %+v", early)
+	}
+
+	// up ends during the grace: nothing handed back, a connection made is closed
+	ctx, cancel := context.WithCancel(context.Background())
+	var made atomic.Pointer[fakeRelayConn]
+	go func() { time.Sleep(70 * time.Millisecond); cancel() }()
+	home, early2 := awaitPairing(ctx, grace, dialAfter, poll, func() bool { return false },
+		func(context.Context) (*fakeRelayConn, error) {
+			time.Sleep(40 * time.Millisecond)
+			c := &fakeRelayConn{}
+			made.Store(c)
+			return c, nil
+		})
+	time.Sleep(80 * time.Millisecond)
+	if home || early2 != nil || made.Load() == nil || !made.Load().closed.Load() {
+		t.Fatalf("cancelled: home %v, early %+v, made %+v", home, early2, made.Load())
 	}
 }

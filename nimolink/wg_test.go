@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -17,7 +19,7 @@ func testConfig(t *testing.T) Config {
 		t.Fatal(err)
 	}
 	_, nasPub, _ := newKeyPair()
-	return Config{NAS: "http://192.168.1.118", PrivateKey: priv, NASPublicKey: nasPub, NASAddress: "100.64.7.1",
+	return Config{NAS: "http://192.168.1.118", DeviceToken: "TOKEN", PrivateKey: priv, NASPublicKey: nasPub, NASAddress: "100.64.7.1",
 		ClientAddress: "100.64.7.5", Subnet: "100.64.7.0/24", Port: 51900, Endpoints: []string{"10.0.0.5:51900"}, Keepalive: 25, MTU: 1280}
 }
 
@@ -112,6 +114,65 @@ func TestParseStatus(t *testing.T) {
 	}
 }
 
+func TestReportHandshake(t *testing.T) {
+	var shaken atomic.Bool
+	status := func() TunnelStatus {
+		st := TunnelStatus{Endpoint: "127.77.0.1:9"}
+		if shaken.Load() {
+			st.LastHandshake = time.Now()
+		}
+		return st
+	}
+	run := func(done chan struct{}) (*bytes.Buffer, chan struct{}) {
+		var out bytes.Buffer
+		ended := make(chan struct{})
+		go func() {
+			reportHandshake(&out, "100.64.7.1", 50*time.Millisecond, 5*time.Millisecond, status, done)
+			close(ended)
+		}()
+		return &out, ended
+	}
+
+	// in time: connected, and nothing else
+	shaken.Store(true)
+	out, ended := run(make(chan struct{}))
+	<-ended
+	if out.String() != "connected: open http://100.64.7.1/\n" {
+		t.Fatalf("in time: %q", out.String())
+	}
+
+	// late: the status line at the deadline, then connected once it comes
+	shaken.Store(false)
+	out, ended = run(make(chan struct{}))
+	time.Sleep(120 * time.Millisecond)
+	shaken.Store(true)
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a late handshake was not reported")
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "no handshake yet") ||
+		!strings.HasPrefix(lines[1], "connected after ") || !strings.HasSuffix(lines[1], ": open http://100.64.7.1/") {
+		t.Fatalf("late: %q", out.String())
+	}
+
+	// never: the status line once, and it stops with the tunnel
+	shaken.Store(false)
+	done := make(chan struct{})
+	out, ended = run(done)
+	time.Sleep(120 * time.Millisecond)
+	close(done)
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not stop with the tunnel")
+	}
+	if !strings.HasPrefix(out.String(), "no handshake yet") || strings.Count(out.String(), "\n") != 1 {
+		t.Fatalf("never: %q", out.String())
+	}
+}
+
 func TestClassifyControlErr(t *testing.T) {
 	if got := classifyControlErr(&net.OpError{Op: "dial", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ENOENT}}); got != errTunnelDown {
 		t.Errorf("not-exist: %v", got)
@@ -159,6 +220,11 @@ func TestValidatePairing(t *testing.T) {
 		"mtu huge":           func(c *Config) { c.MTU = 70000 },
 		"keepalive huge":     func(c *Config) { c.Keepalive = 100000 },
 		"keepalive negative": func(c *Config) { c.Keepalive = -1 },
+		"NAS key empty":      func(c *Config) { c.NASPublicKey = "" },
+		"no device token":    func(c *Config) { c.DeviceToken = "" },
+		"NAS key not base64": func(c *Config) { c.NASPublicKey = "not a key" },
+		"NAS key 31 bytes":   func(c *Config) { c.NASPublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==" },
+		"NAS key unpadded":   func(c *Config) { c.NASPublicKey = strings.TrimRight(c.NASPublicKey, "=") },
 	} {
 		c := testConfig(t)
 		mut(&c)

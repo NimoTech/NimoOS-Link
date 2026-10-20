@@ -17,6 +17,18 @@
 # relay's rate on a 20 MB download, the move to a direct path once UDP is let
 # through again (and back), and that removing the device ends `up`. Needs the
 # NAS's remote access on (a remote_url in the pairing) and iptables.
+# NAT=easy or NAT=strict puts the client behind a home router of its own (a
+# second namespace that translates its addresses) and has the NAS let in only
+# answers on its WireGuard port, like a NAS behind a router without port
+# mappings: a direct path then needs both sides to punch. A STUN service on
+# this machine tells the client its address outside its router. easy maps one
+# port for every destination (Linux's usual NAT): the client must move from
+# the relay to a direct path. strict maps a new port for each destination
+# (symmetric NAT): punching cannot work and the client must stay on the relay.
+# Needs what RELAY=1 needs; the two do not go together.
+# KEEP_TRACE=1 keeps the run's `nimolink --trace` output (pair.trace, up.log,
+# up.trace; passwords, tokens and check keys are hidden) in a new directory
+# the script makes under /tmp, private to root; it prints where.
 # Do not run it with `bash -x`: that would trace the password and the token.
 set -euo pipefail
 : "${NAS_USER:?}" "${BIN:?path to the nimolink binary}"
@@ -25,6 +37,7 @@ set -euo pipefail
 NS=nlc HOST_IF=nlc-host HOST_IP=10.199.0.1 NS_IP=10.199.0.2
 WORK="" DEVICE_ID="" TOKEN="" REVOKED=0 MADE_NS=0 MADE_LINK=0 CLIENT_STARTED=0 MADE_HOME=0
 RELAY=${RELAY:-0} MADE_ETC=0 NAT_RULE=() HTTP_PID=""
+NAT=${NAT:-} RNS=nlr LAN_IP=10.199.1.1 CLIENT_IP=10.199.1.2 STUN_IP=10.199.0.9 MADE_RNS=0 STUN_PID="" WG_RULE=()
 GW_INI=/etc/nimoos/gateway.ini
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "ok: $*"; }
@@ -33,8 +46,23 @@ inns() { ip netns exec "$NS" "$@"; }
 for tool in python3 curl ip ss; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is required but not installed"
 done
-if [ "$RELAY" = 1 ]; then
-  command -v iptables >/dev/null 2>&1 || fail "RELAY=1 needs iptables"
+KEEP_TRACE=${KEEP_TRACE:-0}
+if [ "$KEEP_TRACE" = 1 ]; then
+  # Not a path the caller names: a new directory of root's, mode 0700, in
+  # sticky /tmp, so nobody else can plant a link in it or swap it out.
+  [ -k /tmp ] || fail "/tmp is not sticky"
+  TRACE_DIR=$(mktemp -d /tmp/nimolink-e2e-trace.XXXXXX) || fail "cannot create a trace directory"
+fi
+case "$NAT" in
+  "" | easy | strict) ;;
+  *) fail "NAT must be easy or strict, not $NAT" ;;
+esac
+[ -z "$NAT" ] || [ "$RELAY" != 1 ] || fail "RELAY=1 and NAT do not go together"
+# both reach the relay from the namespace
+VIA_RELAY=0
+if [ "$RELAY" = 1 ] || [ -n "$NAT" ]; then VIA_RELAY=1; fi
+if [ "$VIA_RELAY" = 1 ]; then
+  command -v iptables >/dev/null 2>&1 || fail "RELAY=1 and NAT need iptables"
   [ ! -e "/etc/netns/$NS" ] || fail "/etc/netns/$NS already exists"
 fi
 
@@ -46,6 +74,11 @@ routes=$(ip -4 route show 2>/dev/null || true)
 [[ $netns_list =~ (^|$'\n')$NS([[:space:]]|$) ]] && fail "a network namespace named $NS already exists"
 [[ $links =~ :[[:space:]]($HOST_IF|nlc-ns)[@:[:space:]] ]] && fail "a link named $HOST_IF or nlc-ns already exists"
 [[ $addrs =~ 10\.199\.0\. || $routes =~ 10\.199\.0\. ]] && fail "10.199.0.0/24 is already in use on this host"
+if [ -n "$NAT" ]; then # what only the client's router adds
+  [[ $netns_list =~ (^|$'\n')$RNS([[:space:]]|$) ]] && fail "a network namespace named $RNS already exists"
+  [[ $links =~ :[[:space:]](nlr-wan|nlr-lan)[@:[:space:]] ]] && fail "a link named nlr-wan or nlr-lan already exists"
+  [[ $addrs =~ 10\.199\.1\. || $routes =~ 10\.199\.1\. ]] && fail "10.199.1.0/24 is already in use on this host"
+fi
 # `ip netns exec` does not isolate /run: a real tunnel would collide with ours.
 for f in /run/nimolink.pid /var/run/wireguard/nimolink0.sock; do
   [ ! -e "$f" ] || fail "$f exists: a nimolink tunnel is running on this host; stop it first"
@@ -82,7 +115,9 @@ cleanup() {
   # Only what this run created is touched. No `nimolink down` here: it acts
   # on the host-wide pid file and could stop a real tunnel.
   [ -z "$HTTP_PID" ] || kill "$HTTP_PID" 2>/dev/null || true
+  [ -z "$STUN_PID" ] || kill "$STUN_PID" 2>/dev/null || true
   [ "${#NAT_RULE[@]}" = 0 ] || iptables -t nat -D POSTROUTING "${NAT_RULE[@]}" 2>/dev/null || true
+  [ "${#WG_RULE[@]}" = 0 ] || iptables -D INPUT "${WG_RULE[@]}" 2>/dev/null || true
   [ "$MADE_ETC" = 0 ] || rm -rf "/etc/netns/$NS"
   if [ "$MADE_NS" = 1 ]; then
     ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
@@ -94,6 +129,8 @@ cleanup() {
     sleep 0.3
     ip netns del "$NS" 2>/dev/null || true
   fi
+  # its links go with it, the host's end of the pair too
+  [ "$MADE_RNS" = 0 ] || ip netns del "$RNS" 2>/dev/null || true
   [ "$MADE_LINK" = 0 ] || ip link del "$HOST_IF" 2>/dev/null || true
   if [ "$CLIENT_STARTED" = 1 ]; then
     for f in /run/nimolink.pid /var/run/wireguard/nimolink0.sock; do
@@ -107,6 +144,11 @@ cleanup() {
       echo "NOTE: restore $GW_INI from $WORK/gateway.ini.orig and restart nimoos-gateway" >&2
     fi
   fi
+  if [ "$KEEP_TRACE" = 1 ] && [ -n "$WORK" ]; then
+    for f in pair.trace up.log; do [ ! -f "$WORK/$f" ] || cp "$WORK/$f" "$TRACE_DIR/$f"; done
+    [ ! -f "$WORK/trace.log" ] || cp "$WORK/trace.log" "$TRACE_DIR/up.trace"
+    echo "traces kept in $TRACE_DIR (readable by root only)"
+  fi
   if [ -n "$WORK" ]; then
     if [ "$MADE_HOME" = 1 ] && ! cmp -s "$WORK/gateway.ini.orig" "$GW_INI"; then
       echo "kept $WORK (it holds the original gateway.ini)" >&2
@@ -118,11 +160,39 @@ cleanup() {
 trap cleanup EXIT
 
 ip netns add "$NS"; MADE_NS=1
-ip link add "$HOST_IF" type veth peer name nlc-ns; MADE_LINK=1
-ip link set nlc-ns netns "$NS"
-ip addr add "$HOST_IP/24" dev "$HOST_IF" && ip link set "$HOST_IF" up
-inns ip addr add "$NS_IP/24" dev nlc-ns
-inns ip link set nlc-ns up && inns ip link set lo up
+if [ -z "$NAT" ]; then
+  ip link add "$HOST_IF" type veth peer name nlc-ns; MADE_LINK=1
+  ip link set nlc-ns netns "$NS"
+  ip addr add "$HOST_IP/24" dev "$HOST_IF" && ip link set "$HOST_IF" up
+  inns ip addr add "$NS_IP/24" dev nlc-ns
+  inns ip link set nlc-ns up && inns ip link set lo up
+else
+  # client (nlc-ns, CLIENT_IP) -- its router (nlr-lan | nlr-wan, NS_IP) --
+  # this machine (HOST_IF, HOST_IP). The NAS sees only the router's address.
+  inr() { ip netns exec "$RNS" "$@"; }
+  ip netns add "$RNS"; MADE_RNS=1
+  ip link add "$HOST_IF" type veth peer name nlr-wan; MADE_LINK=1
+  ip link set nlr-wan netns "$RNS"
+  ip link add nlr-lan type veth peer name nlc-ns
+  ip link set nlr-lan netns "$RNS"
+  ip link set nlc-ns netns "$NS"
+  ip addr add "$HOST_IP/24" dev "$HOST_IF" && ip link set "$HOST_IF" up
+  inr ip addr add "$NS_IP/24" dev nlr-wan
+  inr ip addr add "$LAN_IP/24" dev nlr-lan
+  inr ip link set nlr-wan up && inr ip link set nlr-lan up && inr ip link set lo up
+  inns ip addr add "$CLIENT_IP/24" dev nlc-ns
+  inns ip link set nlc-ns up && inns ip link set lo up
+  inns ip route add 10.199.0.0/24 via "$LAN_IP"
+  inr sysctl -qw net.ipv4.ip_forward=1
+  # From outside only answers get in, as with a home router.
+  inr iptables -A FORWARD -i nlr-wan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  inr iptables -A FORWARD -i nlr-wan -j DROP
+  if [ "$NAT" = easy ]; then
+    inr iptables -t nat -A POSTROUTING -o nlr-wan -j MASQUERADE
+  else
+    inr iptables -t nat -A POSTROUTING -o nlr-wan -j MASQUERADE --random-fully
+  fi
+fi
 
 # The test's home network is a veth pair, which the Gateway does not count as
 # a home interface. For the run it is added to home_interfaces: to the list
@@ -172,7 +242,9 @@ sleep 3 # the tunnel comes up on the first sweep
 ok "home_interfaces for the run: $homes"
 
 # 1. pair over the "home network" link
-inns "$BIN" pair "$HOST_IP" -user "$NAS_USER" -name "e2e-netns" || fail "pairing (if the NAS did accept it, a device named e2e-netns may be on the account: remove it in the panel)"
+PAIR_TRACE=()
+[ "$KEEP_TRACE" = 1 ] && PAIR_TRACE=(--trace)
+inns "$BIN" "${PAIR_TRACE[@]}" pair "$HOST_IP" -user "$NAS_USER" -name "e2e-netns" 2> >(tee "$WORK/pair.trace" >&2) || fail "pairing (if the NAS did accept it, a device named e2e-netns may be on the account: remove it in the panel)"
 read -r NAS_VIP DEVICE_ID CLIENT_VIP < <(python3 -c "
 import json,os
 c=json.load(open(os.environ['NIMOLINK_CONFIG']+'/config.json'))
@@ -181,8 +253,8 @@ print(c['nas_address'], c['device_id'], c['client_address'])") || true
 ok "paired as device $DEVICE_ID; the NAS is $NAS_VIP"
 
 # 1b. RELAY=1: the namespace reaches the relay and nothing else out there,
-#     and sends no UDP at all.
-if [ "$RELAY" = 1 ]; then
+#     and sends no UDP at all. NAT: the same, through its router, with UDP.
+if [ "$VIA_RELAY" = 1 ]; then
   RELAY_HOST=$(python3 -c "
 import json,os,urllib.parse
 print(urllib.parse.urlparse(json.load(open(os.environ['NIMOLINK_CONFIG']+'/config.json')).get('remote_url') or '').hostname or '')")
@@ -190,10 +262,15 @@ print(urllib.parse.urlparse(json.load(open(os.environ['NIMOLINK_CONFIG']+'/confi
   RELAY_IP=$(python3 -c "import socket,sys;print(socket.gethostbyname(sys.argv[1]))" "$RELAY_HOST") || fail "cannot resolve $RELAY_HOST"
   mkdir -p "/etc/netns/$NS"; MADE_ETC=1
   printf '127.0.0.1 localhost\n%s %s\n' "$RELAY_IP" "$RELAY_HOST" >"/etc/netns/$NS/hosts"
-  inns ip route add "$RELAY_IP/32" via "$HOST_IP"
+  if [ -n "$NAT" ]; then
+    inns ip route add "$RELAY_IP/32" via "$LAN_IP"
+    inr ip route add "$RELAY_IP/32" via "$HOST_IP"
+  else
+    inns ip route add "$RELAY_IP/32" via "$HOST_IP"
+  fi
   NAT_RULE=(-s "$NS_IP/32" -d "$RELAY_IP/32" -j MASQUERADE)
   iptables -t nat -I POSTROUTING "${NAT_RULE[@]}"
-  inns iptables -I OUTPUT -p udp -j DROP
+  if [ "$RELAY" = 1 ]; then inns iptables -I OUTPUT -p udp -j DROP; fi
   # This host's uplink drops some new connections: a few tries.
   reached=no
   for i in 1 2 3 4 5; do
@@ -202,7 +279,48 @@ print(urllib.parse.urlparse(json.load(open(os.environ['NIMOLINK_CONFIG']+'/confi
     sleep 2
   done
   [ "$reached" = yes ] || fail "the namespace cannot reach the relay at $RELAY_HOST ($RELAY_IP)"
-  ok "namespace: only the relay $RELAY_HOST ($RELAY_IP) is reachable, no UDP leaves"
+  if [ "$RELAY" = 1 ]; then
+    ok "namespace: only the relay $RELAY_HOST ($RELAY_IP) is reachable, no UDP leaves"
+  else
+    ok "namespace: behind a $NAT NAT, the relay $RELAY_HOST ($RELAY_IP) is reachable"
+  fi
+fi
+
+# 1c. NAT: the NAS lets in only answers on its WireGuard port, and a STUN
+#     service on this machine shows the client its router's outside address.
+if [ -n "$NAT" ]; then
+  WG_PORT=$(python3 -c "import json,os;print(int(json.load(open(os.environ['NIMOLINK_CONFIG']+'/config.json'))['port']))") || fail "no port in the pairing"
+  WG_RULE=(-i "$HOST_IF" -p udp --dport "$WG_PORT" -m conntrack --ctstate NEW -j DROP)
+  iptables -I INPUT "${WG_RULE[@]}"
+  ip addr add "$STUN_IP/24" dev "$HOST_IF"
+  cat >"$WORK/stun.py" <<'STUN'
+# answers a binding request with XOR-MAPPED-ADDRESS and FINGERPRINT
+import socket, struct, sys, zlib
+COOKIE = b'\x21\x12\xa4\x42'
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], 3478))
+while True:
+    b, (ip, port) = s.recvfrom(2048)
+    if len(b) < 20 or b[:2] != b'\x00\x01' or b[4:8] != COOKIE:
+        continue
+    xaddr = struct.pack('!BBH', 0, 1, port ^ 0x2112) + bytes(x ^ y for x, y in zip(socket.inet_aton(ip), COOKIE))
+    body = struct.pack('!HH', 0x0020, len(xaddr)) + xaddr
+    msg = struct.pack('!HH', 0x0101, len(body) + 8) + COOKIE + b[8:20] + body
+    fp = (zlib.crc32(msg) ^ 0x5354554e) & 0xffffffff
+    s.sendto(msg + struct.pack('!HHI', 0x8028, 4, fp), (ip, port))
+STUN
+  python3 -I "$WORK/stun.py" "$STUN_IP" &
+  STUN_PID=$!
+  # the client asks this STUN service instead of the relay's
+  python3 - "$NIMOLINK_CONFIG/config.json" "$STUN_IP:3478" <<'PY2' || fail "could not point the pairing at the test's STUN service"
+import json, sys
+path, srv = sys.argv[1], sys.argv[2]
+c = json.load(open(path))
+c['stun_server'] = srv
+with open(path, 'w') as f:  # the same file: its owner and mode stay
+    json.dump(c, f, indent=2)
+PY2
+  ok "NAS: only answers get in on UDP $WG_PORT from the test network; STUN at $STUN_IP:3478"
 fi
 
 # 2. connect. The home router's address is sent into the tunnel as well, to
@@ -216,6 +334,29 @@ grep -q "^connected" "$NIMOLINK_CONFIG/up.log" || { cat "$NIMOLINK_CONFIG/up.log
 if [ "$RELAY" = 1 ]; then
   inns "$BIN" status | grep -q "^over the relay" || fail "status does not say relay: $(inns "$BIN" status)"
   inns "$BIN" status | grep -q "^path: relay $RELAY_HOST" || fail "status path: $(inns "$BIN" status)"
+elif [ "$NAT" = easy ]; then
+  # Nothing answers directly before both sides punch: the relay first, then
+  # a direct path through both "routers".
+  moved=no
+  for i in $(seq 1 60); do
+    p=$(inns "$BIN" status | sed -n 's/^path: //p')
+    if [ -n "$p" ] && [[ $p != relay* ]]; then moved=yes; echo "info: direct ~${i}s after connecting: $p"; break; fi
+    sleep 1
+  done
+  [ "$moved" = yes ] || fail "behind an easy NAT, still not direct 60 s after connecting: $(inns "$BIN" status)"
+  # one of the NAS's addresses on the test network (the STUN service's too)
+  inns "$BIN" status | grep -q "^direct to 10\.199\.0\.[0-9]*:$WG_PORT," || fail "status: $(inns "$BIN" status)"
+  ok "easy NAT: punched through to a direct path ($p)"
+elif [ "$NAT" = strict ]; then
+  # A new port for each destination: what STUN saw is not where the client
+  # sends from, so the NAS's punches miss. It stays on the relay.
+  for i in $(seq 1 45); do
+    p=$(inns "$BIN" status | sed -n 's/^path: //p')
+    [[ -z $p || $p == relay* ]] || fail "behind a strict NAT the client found a direct path ($p): the test does not model what it should"
+    sleep 1
+  done
+  inns "$BIN" status | grep -q "^path: relay $RELAY_HOST" || fail "status path: $(inns "$BIN" status)"
+  ok "strict NAT: no direct path in 45 s, the relay carries the tunnel"
 else
   inns "$BIN" status | grep -q "^direct to" || fail "status does not say direct"
 fi

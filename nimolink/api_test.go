@@ -105,10 +105,16 @@ func TestPairCall(t *testing.T) {
 			t.Errorf("%s: %v, want a message about %q", code, err, want)
 		}
 	}
-	// a 200 that is missing what a tunnel needs is not a success
-	status, answer = http.StatusOK, `{"success":200,"message":"ok","data":{"device_id":7}}`
+	// a 200 that registered no device is not a success
+	status, answer = http.StatusOK, `{"success":200,"message":"ok","data":{"device_token":"DEVTOKEN"}}`
 	if _, err := a.Pair("ACCESS", "PUB", "", "linux"); err == nil {
-		t.Fatal("an incomplete answer was accepted")
+		t.Fatal("an answer without a device was accepted")
+	}
+	// one that did but is missing the rest comes back, so that savePairing
+	// can refuse it and remove the device again
+	status, answer = http.StatusOK, `{"success":200,"message":"ok","data":{"device_id":7}}`
+	if res, err := a.Pair("ACCESS", "PUB", "", "linux"); err != nil || res.DeviceID != 7 {
+		t.Fatalf("%+v %v", res, err)
 	}
 }
 
@@ -220,6 +226,19 @@ func TestSavePairingRevokesOnFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "removed") {
 		t.Errorf("the error does not say the device was removed: %v", err)
 	}
+	// an answer that is not usable (here: no device token) is not saved,
+	// and the device goes again
+	t.Setenv("NIMOLINK_CONFIG", t.TempDir())
+	bad := testConfig(t)
+	bad.DeviceID, bad.DeviceToken = 8, ""
+	method, path = "", ""
+	if err := savePairing(a, "ACCESS", bad); err == nil || method != http.MethodDelete || path != "/v1/users/remote/devices/8" {
+		t.Fatalf("err=%v %s %s", err, method, path)
+	}
+	if _, err := os.Stat(filepath.Join(os.Getenv("NIMOLINK_CONFIG"), "config.json")); !os.IsNotExist(err) {
+		t.Fatalf("an unusable pairing was saved: %v", err)
+	}
+	t.Setenv("NIMOLINK_CONFIG", dir)
 	status = http.StatusInternalServerError
 	err = savePairing(a, "ACCESS", c)
 	if err == nil || !strings.Contains(err.Error(), "7") || !strings.Contains(err.Error(), "panel") {

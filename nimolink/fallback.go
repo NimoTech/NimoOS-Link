@@ -156,6 +156,69 @@ type relayState struct {
 	backoff time.Duration
 }
 
+// earlyRelay is the result of a relay dial made during the start's grace.
+type earlyRelay[C any] struct {
+	conn C
+	err  error
+}
+
+// awaitPairing gives the pairing endpoint up to grace to shake hands (at home
+// it does, and there the relay is not wanted). Once dialAfter has passed
+// without a handshake it already dials the relay, so that a client away from
+// home has it ready when the grace ends instead of starting then. home: the
+// endpoint answered; a connection dialed meanwhile is closed. Otherwise early
+// is that dial's result (waited for), or nil when none was started or ctx
+// ended. A nil dial never dials (-path=direct).
+func awaitPairing[C interface{ Close() error }](ctx context.Context, grace, dialAfter, poll time.Duration,
+	fresh func() bool, dial func(context.Context) (C, error)) (home bool, early *earlyRelay[C]) {
+	start := time.Now()
+	var ch chan earlyRelay[C]
+	discard := func() {
+		if ch != nil {
+			go func() {
+				if r := <-ch; r.err == nil {
+					r.conn.Close()
+				}
+			}()
+		}
+	}
+	for time.Since(start) < grace {
+		if fresh() {
+			discard()
+			return true, nil
+		}
+		if ch == nil && dial != nil && time.Since(start) >= dialAfter {
+			ch = make(chan earlyRelay[C], 1)
+			go func() {
+				c, err := dial(ctx)
+				ch <- earlyRelay[C]{c, err}
+			}()
+		}
+		select {
+		case <-ctx.Done():
+			discard()
+			return false, nil
+		case <-time.After(poll):
+		}
+	}
+	if ch == nil {
+		return false, nil
+	}
+	select {
+	case r := <-ch:
+		if fresh() { // it answered while the relay was still being dialed
+			if r.err == nil {
+				r.conn.Close()
+			}
+			return true, nil
+		}
+		return false, &r
+	case <-ctx.Done():
+		discard()
+		return false, nil
+	}
+}
+
 // relayDue: open a fallback connection now? Only when the current path does
 // not answer, none is open, and nothing says wait.
 func relayDue(now time.Time, s relayState, curAlive bool) bool {

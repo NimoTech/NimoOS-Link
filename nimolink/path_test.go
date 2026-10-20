@@ -35,7 +35,7 @@ func TestPathSwitchRules(t *testing.T) {
 
 // Any direct path that answers beats the relay; the relay never beats one.
 func TestRankRelayLast(t *testing.T) {
-	relay := Path{"relay", "5wmfzvxpsm.relay-test.nimotech.ai"}
+	relay := Path{"relay", "k7f3x2ab2m.relay-test.nimotech.ai"}
 	for _, d := range []Path{{"stun", "203.0.113.7:51446"}, {"ipv6", "[2001:db8::1]:51900"}, {"lan", "192.168.1.118:51900"}} {
 		if !shouldSwitch(relay, true, d) {
 			t.Errorf("stayed on the relay over %v", d)
