@@ -157,22 +157,50 @@ func cmdUp(args []string, trace io.Writer) error {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	endpoint := fs.String("endpoint", "", "HOST:PORT to reach the NAS's tunnel on")
 	extra := fs.String("test-allowed-ips", "", "testing only: extra networks to send into the tunnel, comma-separated")
+	path := fs.String("path", "", "testing only: relay (only the relay fallback) or direct (never it)")
 	_ = fs.Parse(args)
+	if err := checkPathMode(*path, *endpoint); err != nil {
+		return err
+	}
 	c, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	// No usable pairing endpoint is fine when the NAS has a remote address:
-	// connect finds the way.
-	ep, forced, err := initialEndpoint(c, *endpoint, udpResolves)
-	if err != nil {
-		return err
+	var ep string
+	forced := false
+	switch {
+	case *path == "relay":
+		if c.RemoteURL == "" {
+			return errors.New("-path=relay: this NAS has no remote address")
+		}
+		// No endpoint: nothing goes out directly before the relay is up.
+	default:
+		// No usable pairing endpoint is fine when the NAS has a remote
+		// address: connect finds the way.
+		if ep, forced, err = initialEndpoint(c, *endpoint, udpResolves); err != nil {
+			return err
+		}
 	}
 	var extras []string
 	if *extra != "" {
 		extras = strings.Split(*extra, ",")
 	}
-	return runUp(c, ep, forced, extras, trace)
+	return runUp(c, ep, forced, *path, extras, trace)
+}
+
+// checkPathMode: -path is "", relay or direct; relay finds its own way, so
+// it does not go with -endpoint.
+func checkPathMode(mode, endpoint string) error {
+	switch mode {
+	case "", "direct":
+		return nil
+	case "relay":
+		if endpoint != "" {
+			return errors.New("-path=relay and -endpoint do not go together")
+		}
+		return nil
+	}
+	return fmt.Errorf("-path must be relay or direct, not %q", mode)
 }
 
 func main() {

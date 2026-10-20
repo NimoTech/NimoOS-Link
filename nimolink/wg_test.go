@@ -98,6 +98,11 @@ func TestParseStatus(t *testing.T) {
 	if got := statusLine(st, time.Unix(1760000042, 0)); !strings.Contains(got, "direct") || !strings.Contains(got, "42s ago") || !strings.Contains(got, "192.168.1.118:51900") {
 		t.Fatalf("status line %q", got)
 	}
+	relayed := st
+	relayed.Endpoint = "127.77.0.1:9"
+	if got := statusLine(relayed, time.Unix(1760000042, 0)); !strings.HasPrefix(got, "over the relay") || strings.Contains(got, "127.77") {
+		t.Fatalf("status line on the relay %q", got)
+	}
 	// a handshake older than three minutes is a dead tunnel, and is called that
 	if got := statusLine(st, time.Unix(1760000000+600, 0)); !strings.Contains(got, "stale") {
 		t.Fatalf("stale: %q", got)

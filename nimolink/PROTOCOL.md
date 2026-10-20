@@ -1,7 +1,8 @@
 # NimoLink direct connections: the client's side of the protocol
 
 This is what `nimolink` does to reach a NimoOS NAS over WireGuard without a
-relay in the data path. It is written for people building another client.
+relay in the data path, and (§6) through the relay when no direct path
+answers. It is written for people building another client.
 Pairing (`POST /v1/gateway/link/direct/pair`) is described in the Gateway's
 OpenAPI spec; this file starts after it, with a saved pairing: the device
 token, the NAS's public key, the tunnel network, the WireGuard port (51900 by
@@ -148,3 +149,56 @@ checks: offered [{lan 172.31.44.8:51600} {stun 52.15.161.48:51600}], NAS [{lan 1
 path: stun 203.0.113.7:36127
 connected: open http://100.91.200.1/
 ```
+
+## 6. The relay fallback
+
+When no direct path answers, WireGuard travels over TLS to the NAS's remote
+address, through the relay. The relay forwards it by SNI like any visitor and
+holds it to its own rate (5 Mbps each way per NAS by default); the NAS ends
+the TLS.
+
+1. TLS 1.2 or later to the remote address's host on port 443, SNI that host,
+   the NAS's certificate verified as usual, and **only** `nimolink-wg/1` in
+   the ALPN list. A NAS that does not know the protocol fails the handshake
+   (`no_application_protocol`) or negotiates something else: it has no
+   fallback.
+2. Everything after the handshake is frames: a `uint16` big-endian length,
+   1–65535, then that many bytes. A frame of length 0 is invalid and ends
+   the connection. Constants and the codec are in `protocol`
+   (`FallbackALPN`, `WriteFrame`, `ReadFrame`).
+3. The client's first frame is the device token, within 10 s.
+4. The NAS answers one frame of one byte, and closes after anything but 0:
+   - `0`: from now on every frame, either way, is one WireGuard packet;
+   - `1`: the token is no good: the device was removed (as connect's `401
+     CLIENT_INVALID`);
+   - `2`: not now (the NAS's user service or its WireGuard is down): retry
+     later.
+5. There is no keepalive of its own: WireGuard's keepalive is the traffic.
+   The NAS closes a connection that carried nothing for 3 minutes, an older
+   one when the same token opens a new one, and every one within 10 s of the
+   device being removed.
+
+How `nimolink` uses it. The fallback connection is a made-up endpoint inside
+the WireGuard Bind (`direct.RelayEndpoint`, `127.77.0.1:9`, never on the
+network): WireGuard sends to it, the Bind writes frames; frames read are
+handed to WireGuard as packets from it. So any wireguard-go host can carry
+the fallback without a local proxy.
+
+- When the current path does not answer (no path yet, no handshake for the
+  time in §4, or, after an address change, no answer in that round), the
+  client opens a fallback connection and points WireGuard at the relay
+  endpoint first (usable within about a second), and looks for a direct path
+  as in §4. When starting from pairing's endpoint it first gives that
+  endpoint 5 s to complete a handshake: at home it does, and no fallback
+  connection is made.
+- The relay ranks after every direct path: one that answers replaces it.
+  From then on packets that still arrive over the fallback connection are
+  dropped (they would make WireGuard roam back), and the connection is closed
+  30 s later; if the direct path dies before that, the client goes back to
+  it.
+- A lost fallback connection while on the relay is reopened after 1 s,
+  doubling up to 30 s. Status `1` ends `up` like connect's 401. A NAS without
+  the fallback is not asked again for an hour.
+- `nimolink status` shows `path: relay <host>`. `nimolink --trace up`
+  prints the fallback's dial, status and close. `up -path=relay` uses only
+  the relay, `up -path=direct` never; both are for testing.

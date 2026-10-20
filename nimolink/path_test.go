@@ -33,6 +33,19 @@ func TestPathSwitchRules(t *testing.T) {
 	}
 }
 
+// Any direct path that answers beats the relay; the relay never beats one.
+func TestRankRelayLast(t *testing.T) {
+	relay := Path{"relay", "5wmfzvxpsm.relay-test.nimotech.ai"}
+	for _, d := range []Path{{"stun", "203.0.113.7:51446"}, {"ipv6", "[2001:db8::1]:51900"}, {"lan", "192.168.1.118:51900"}} {
+		if !shouldSwitch(relay, true, d) {
+			t.Errorf("stayed on the relay over %v", d)
+		}
+		if shouldSwitch(d, true, relay) {
+			t.Errorf("left %v for the relay", d)
+		}
+	}
+}
+
 func TestUAPIWithoutEndpoint(t *testing.T) {
 	c := testConfig(t) // the helper wg_test.go uses for a valid paired Config
 	conf, err := uapiConfig(c, "", nil)

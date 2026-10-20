@@ -44,7 +44,8 @@ func ipCmd(args ...string) error {
 }
 
 // runUp brings the tunnel up and stays in the foreground until a signal.
-func runUp(c Config, endpoint string, forced bool, extraAllowed []string, trace io.Writer) error {
+// mode is -path: "" (automatic), "relay" or "direct".
+func runUp(c Config, endpoint string, forced bool, mode string, extraAllowed []string, trace io.Writer) error {
 	if os.Geteuid() != 0 {
 		return errors.New("`nimolink up` creates a network interface: run it as root")
 	}
@@ -126,15 +127,15 @@ func runUp(c Config, endpoint string, forced bool, extraAllowed []string, trace 
 		via = "a path still to be found"
 	}
 	if !forced && c.RemoteURL != "" {
-		go connectLoop(ctx, c, dev, agent, trace)
+		go connectLoop(ctx, c, dev, bind, agent, mode, trace)
 	}
 
 	fmt.Printf("tunnel up: this device is %s, the NAS is %s (via %s)\n", c.ClientAddress, c.NASAddress, via)
 	go func() {
 		// Say plainly whether the NAS answered; do not leave the user guessing.
 		wait := 10 * time.Second
-		if endpoint == "" {
-			wait = 25 * time.Second // connect has to find the path first
+		if endpoint == "" || (!forced && c.RemoteURL != "") {
+			wait = 25 * time.Second // connect, or the relay, may have to find the way first
 		}
 		deadline := time.Now().Add(wait)
 		for time.Now().Before(deadline) {
@@ -277,7 +278,12 @@ func setPath(p Path) {
 // connectLoop finds the best path and keeps it: at once, then every five
 // minutes, when this machine's addresses change (checked every 5 s), and when
 // the current path stops answering (no handshake within pathStaleAfter).
-func connectLoop(ctx context.Context, c Config, dev *device.Device, agent *direct.Agent, trace io.Writer) {
+//
+// When the current path does not answer, it moves the tunnel onto the relay
+// fallback first (usable in about a second) and keeps looking for a direct
+// path; one that answers replaces the relay, whose connection is closed 30 s
+// later. mode "relay" uses only the relay, "direct" never.
+func connectLoop(ctx context.Context, c Config, dev *device.Device, bind *direct.Bind, agent *direct.Agent, mode string, trace io.Writer) {
 	api := connectAPI(c, trace)
 	var skip netip.Prefix
 	if _, subnet, err := net.ParseCIDR(c.Subnet); err == nil {
@@ -287,16 +293,109 @@ func connectLoop(ctx context.Context, c Config, dev *device.Device, agent *direc
 	next := time.Now()
 	lastAddrs := addrSnapshot()
 	wasAlive := false
+	// A pairing endpoint gets a few seconds to answer before the relay: at
+	// home it does, and there the relay is not wanted.
+	if currentPath().Endpoint != "" && mode != "relay" {
+		for t := time.Now(); time.Since(t) < 5*time.Second && !handshakeFresh(dev, time.Minute); {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+	}
+
+	var rs relayState
+	ended := make(chan *fallbackConn)
+	saidUnsupported := false
+	defer func() {
+		if rs.conn != nil {
+			rs.conn.Close()
+		}
+	}()
+	useRelay := func(fc *fallbackConn) {
+		bind.SetRelay(fc)
+		if err := dev.IpcSet(endpointConfig(c, direct.RelayEndpoint.String())); err != nil {
+			bind.SetRelay(nil)
+			return
+		}
+		rs.left = time.Time{}
+		setPath(Path{"relay", fc.host})
+		fmt.Printf("path: relay %s\n", fc.host)
+	}
+	// toRelay puts the tunnel on the relay: the connection kept from before,
+	// or a new one when one is due. false: up must end.
+	toRelay := func(now time.Time) bool {
+		if rs.conn != nil {
+			useRelay(rs.conn)
+			return true
+		}
+		if !relayDue(now, rs, false) {
+			return true
+		}
+		fc, err := dialFallback(ctx, c, trace)
+		switch {
+		case ctx.Err() != nil:
+			return true
+		case errors.Is(err, ErrDeviceRemoved):
+			fmt.Println(err)
+			dev.Close()
+			return false
+		case errors.Is(err, errFallbackUnsupported):
+			if !saidUnsupported {
+				fmt.Println(err)
+				saidUnsupported = true
+			}
+			rs.next = now.Add(relayUnsupportedWait)
+		case err != nil:
+			rs.failed(time.Now())
+			if trace != nil {
+				fmt.Fprintf(trace, "fallback: %v; next try in %s\n", err, rs.next.Sub(time.Now()).Round(time.Second))
+			}
+		default:
+			rs.conn = fc
+			go func() {
+				err := fc.Run(bind)
+				if trace != nil {
+					fmt.Fprintf(trace, "fallback: connection closed (%v)\n", err)
+				}
+				select {
+				case ended <- fc:
+				case <-ctx.Done():
+				}
+			}()
+			useRelay(fc)
+		}
+		return true
+	}
+
 	for {
+		now := time.Now()
+		cur := currentPath()
+		onRelay := cur.Type == "relay"
 		alive := handshakeFresh(dev, pathStaleAfter(c.Keepalive))
+		if onRelay && rs.conn == nil {
+			alive = false // the connection under it is gone
+		}
 		died := wasAlive && !alive
 		wasAlive = alive
+
+		if mode != "direct" && (!alive || (mode == "relay" && !onRelay)) {
+			if !toRelay(now) {
+				return
+			}
+		}
+
 		addrs := addrSnapshot()
 		changed := addrs != lastAddrs
-		if attemptDue(time.Now(), next, died, changed) {
+		if mode != "relay" && attemptDue(time.Now(), next, died, changed) {
 			lastAddrs = addrs
-			cur := currentPath()
+			cur = currentPath()
 			found, curAnswered, err := findPath(ctx, c, api, agent, listenPort(dev), skip, cur, changed, trace)
+			// After a network change the old path answering nothing in this
+			// round means it is gone: use the relay until a direct one answers.
+			curGone := changed && cur.Endpoint != "" && cur.Type != "relay" && !curAnswered &&
+				(err == nil || errors.Is(err, errNoAnswer))
 			switch {
 			case ctx.Err() != nil:
 				return
@@ -317,23 +416,70 @@ func connectLoop(ctx context.Context, c Config, dev *device.Device, agent *direc
 				backoff = 10 * time.Second
 				next = time.Now().Add(5 * time.Minute)
 				if shouldSwitch(cur, aliveForSwitch(alive, changed, curAnswered), found) {
-					if err := dev.IpcSet(endpointConfig(c, found.Endpoint)); err == nil {
+					if cur.Type == "relay" {
+						// First: late relayed packets must not pull WireGuard back.
+						bind.SetRelay(nil)
+					}
+					if err := dev.IpcSet(endpointConfig(c, found.Endpoint)); err != nil {
+						if cur.Type == "relay" && rs.conn != nil {
+							bind.SetRelay(rs.conn) // stay where we were
+						}
+					} else {
+						if cur.Type == "relay" {
+							rs.left = time.Now()
+						}
 						setPath(found)
 						fmt.Printf("path: %s %s\n", found.Type, found.Endpoint)
+						curGone = false
 					}
 				}
+			}
+			if curGone && mode != "direct" && !toRelay(time.Now()) {
+				return
+			}
+		}
+
+		// A relayed packet WireGuard took in before the switch can still
+		// make it roam back to the relay endpoint: point it at the path again.
+		if p := currentPath(); p.Type != "" && p.Type != "relay" && peerEndpoint(dev) == direct.RelayEndpoint.String() {
+			_ = dev.IpcSet(endpointConfig(c, p.Endpoint))
+		}
+
+		if relayCloseDue(time.Now(), rs, currentPath().Type == "relay") {
+			rs.conn.Close() // its Run ends; ended then names a connection no longer ours
+			rs.conn = nil
+		}
+
+		wait := 5 * time.Second
+		if currentPath().Type == "relay" && rs.conn == nil {
+			if d := time.Until(rs.next); d < wait {
+				wait = max(d, 100*time.Millisecond)
 			}
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
+		case fc := <-ended:
+			fc.Close()
+			if fc == rs.conn {
+				rs.conn = nil
+				bind.SetRelay(nil)
+				if time.Since(fc.opened) >= relayKeep {
+					rs.backoff = 0 // it worked for a while: start again at 1 s
+				}
+				rs.failed(time.Now())
+			}
+		case <-time.After(wait):
 		}
 	}
 }
 
+// errNoAnswer: connect worked, but none of the NAS's addresses answered.
+var errNoAnswer = errors.New("no address answered")
+
 // findPath runs connect and the checks. With recheck it also asks whether
-// cur still answers in this session (after a network change).
+// cur still answers in this session (after a network change), also when no
+// new address answered.
 func findPath(ctx context.Context, c Config, api *API, agent *direct.Agent, port uint16, skip netip.Prefix, cur Path, recheck bool, trace io.Writer) (Path, bool, error) {
 	cands := direct.SystemCandidates(port, skip)
 	if srv := stunServerFor(c); srv != "" {
@@ -352,16 +498,13 @@ func findPath(ctx context.Context, c Config, api *API, agent *direct.Agent, port
 	agent.SetSession(res.Session, key)
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	won, err := agent.Check(cctx, res.Candidates, res.Session, key)
+	won, checkErr := agent.Check(cctx, res.Candidates, res.Session, key)
 	if trace != nil {
-		fmt.Fprintf(trace, "checks: offered %v, NAS %v -> %+v %v\n", cands, res.Candidates, won, err)
-	}
-	if err != nil {
-		return Path{}, false, err
+		fmt.Fprintf(trace, "checks: offered %v, NAS %v -> %+v %v\n", cands, res.Candidates, won, checkErr)
 	}
 	answered := false
-	if recheck && cur.Endpoint != "" {
-		if cur.Endpoint == won.Addr {
+	if recheck && cur.Endpoint != "" && cur.Type != "relay" {
+		if checkErr == nil && cur.Endpoint == won.Addr {
 			answered = true
 		} else {
 			rctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
@@ -369,6 +512,9 @@ func findPath(ctx context.Context, c Config, api *API, agent *direct.Agent, port
 			cancel()
 			answered = err == nil
 		}
+	}
+	if checkErr != nil {
+		return Path{}, answered, fmt.Errorf("%w: %v", errNoAnswer, checkErr)
 	}
 	return Path{won.Type, won.Addr}, answered, nil
 }
@@ -385,6 +531,14 @@ func listenPort(dev *device.Device) uint16 {
 		}
 	}
 	return 0
+}
+
+func peerEndpoint(dev *device.Device) string {
+	get, err := dev.IpcGet()
+	if err != nil {
+		return ""
+	}
+	return parseStatus(get).Endpoint
 }
 
 func handshakeFresh(dev *device.Device, d time.Duration) bool {

@@ -7,11 +7,12 @@ import (
 
 // Path is where WireGuard packets go and how that was found.
 type Path struct {
-	Type     string // lan, ipv6, stun, or endpoint (pairing's, or -endpoint)
-	Endpoint string
+	Type     string // lan, ipv6, stun, endpoint (pairing's, or -endpoint), or relay
+	Endpoint string // for relay, the remote address's host
 }
 
-var rank = map[string]int{"lan": 0, "endpoint": 0, "ipv6": 1, "stun": 2}
+// The relay is the last resort: any direct path that answers beats it.
+var rank = map[string]int{"lan": 0, "endpoint": 0, "ipv6": 1, "stun": 2, "relay": 3}
 
 // shouldSwitch: take found when there is no path yet, when the current one
 // stopped answering, or when found is better (home beats the internet).

@@ -11,6 +11,12 @@
 #   DOCKER_PORT=<port a bridge-network app publishes on all addresses>  must answer
 #   DOCKER_LOOPBACK_PORT=<port an app publishes on 127.0.0.1 only>      must not
 #   DOCKER_CONTAINER_IP=<a container's address on its bridge>           must not be routed to
+# RELAY=1 runs everything over the relay fallback instead: the namespace may
+# reach only the relay (its IPv4 address, through this machine's uplink) and
+# sends no UDP, so the pairing endpoint cannot answer. On top it checks the
+# relay's rate on a 20 MB download, the move to a direct path once UDP is let
+# through again (and back), and that removing the device ends `up`. Needs the
+# NAS's remote access on (a remote_url in the pairing) and iptables.
 # Do not run it with `bash -x`: that would trace the password and the token.
 set -euo pipefail
 : "${NAS_USER:?}" "${BIN:?path to the nimolink binary}"
@@ -18,6 +24,7 @@ set -euo pipefail
 
 NS=nlc HOST_IF=nlc-host HOST_IP=10.199.0.1 NS_IP=10.199.0.2
 WORK="" DEVICE_ID="" TOKEN="" REVOKED=0 MADE_NS=0 MADE_LINK=0 CLIENT_STARTED=0 MADE_HOME=0
+RELAY=${RELAY:-0} MADE_ETC=0 NAT_RULE=() HTTP_PID=""
 GW_INI=/etc/nimoos/gateway.ini
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "ok: $*"; }
@@ -26,6 +33,10 @@ inns() { ip netns exec "$NS" "$@"; }
 for tool in python3 curl ip ss; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is required but not installed"
 done
+if [ "$RELAY" = 1 ]; then
+  command -v iptables >/dev/null 2>&1 || fail "RELAY=1 needs iptables"
+  [ ! -e "/etc/netns/$NS" ] || fail "/etc/netns/$NS already exists"
+fi
 
 # Refuse to touch anything that already exists on this host.
 netns_list=$(ip netns list 2>/dev/null || true)
@@ -70,6 +81,9 @@ cleanup() {
   fi
   # Only what this run created is touched. No `nimolink down` here: it acts
   # on the host-wide pid file and could stop a real tunnel.
+  [ -z "$HTTP_PID" ] || kill "$HTTP_PID" 2>/dev/null || true
+  [ "${#NAT_RULE[@]}" = 0 ] || iptables -t nat -D POSTROUTING "${NAT_RULE[@]}" 2>/dev/null || true
+  [ "$MADE_ETC" = 0 ] || rm -rf "/etc/netns/$NS"
   if [ "$MADE_NS" = 1 ]; then
     ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
     for _ in $(seq 1 25); do
@@ -166,14 +180,45 @@ print(c['nas_address'], c['device_id'], c['client_address'])") || true
 [[ $DEVICE_ID =~ ^[0-9]+$ && -n $NAS_VIP && -n $CLIENT_VIP ]] || fail "pairing may have succeeded but the config could not be read back: a device named e2e-netns may have been left on the account, remove it in the panel's device list"
 ok "paired as device $DEVICE_ID; the NAS is $NAS_VIP"
 
+# 1b. RELAY=1: the namespace reaches the relay and nothing else out there,
+#     and sends no UDP at all.
+if [ "$RELAY" = 1 ]; then
+  RELAY_HOST=$(python3 -c "
+import json,os,urllib.parse
+print(urllib.parse.urlparse(json.load(open(os.environ['NIMOLINK_CONFIG']+'/config.json')).get('remote_url') or '').hostname or '')")
+  [ -n "$RELAY_HOST" ] || fail "the pairing has no remote address: turn on remote access on the NAS"
+  RELAY_IP=$(python3 -c "import socket,sys;print(socket.gethostbyname(sys.argv[1]))" "$RELAY_HOST") || fail "cannot resolve $RELAY_HOST"
+  mkdir -p "/etc/netns/$NS"; MADE_ETC=1
+  printf '127.0.0.1 localhost\n%s %s\n' "$RELAY_IP" "$RELAY_HOST" >"/etc/netns/$NS/hosts"
+  inns ip route add "$RELAY_IP/32" via "$HOST_IP"
+  NAT_RULE=(-s "$NS_IP/32" -d "$RELAY_IP/32" -j MASQUERADE)
+  iptables -t nat -I POSTROUTING "${NAT_RULE[@]}"
+  inns iptables -I OUTPUT -p udp -j DROP
+  # This host's uplink drops some new connections: a few tries.
+  reached=no
+  for i in 1 2 3 4 5; do
+    if err=$(inns curl -sS -m 10 -o /dev/null "https://$RELAY_HOST/" 2>&1); then reached=yes; break; fi
+    echo "info: try $i to reach the relay: $err"
+    sleep 2
+  done
+  [ "$reached" = yes ] || fail "the namespace cannot reach the relay at $RELAY_HOST ($RELAY_IP)"
+  ok "namespace: only the relay $RELAY_HOST ($RELAY_IP) is reachable, no UDP leaves"
+fi
+
 # 2. connect. The home router's address is sent into the tunnel as well, to
 #    show in step 6 that the NAS passes nothing on.
 GW=$(ip route show default | awk '{print $3; exit}')
 CLIENT_STARTED=1
-inns "$BIN" up -test-allowed-ips "$GW/32" >"$NIMOLINK_CONFIG/up.log" 2>&1 &
-for i in $(seq 1 20); do grep -q "^connected" "$NIMOLINK_CONFIG/up.log" && break; sleep 0.5; done
+inns "$BIN" --trace up -test-allowed-ips "$GW/32" >"$NIMOLINK_CONFIG/up.log" 2>"$NIMOLINK_CONFIG/trace.log" &
+UP_PID=$!
+for i in $(seq 1 60); do grep -q "^connected" "$NIMOLINK_CONFIG/up.log" && break; sleep 0.5; done
 grep -q "^connected" "$NIMOLINK_CONFIG/up.log" || { cat "$NIMOLINK_CONFIG/up.log"; fail "no handshake"; }
-inns "$BIN" status | grep -q "^direct to" || fail "status does not say direct"
+if [ "$RELAY" = 1 ]; then
+  inns "$BIN" status | grep -q "^over the relay" || fail "status does not say relay: $(inns "$BIN" status)"
+  inns "$BIN" status | grep -q "^path: relay $RELAY_HOST" || fail "status path: $(inns "$BIN" status)"
+else
+  inns "$BIN" status | grep -q "^direct to" || fail "status does not say direct"
+fi
 ok "tunnel up: $(inns "$BIN" status)"
 
 # 3. the panel answers on the virtual address
@@ -306,6 +351,54 @@ ok "the NAS forwards nothing: forwarding off on nimo0, prohibit rule at priority
 # secondary: the home router does not answer through the tunnel either
 if inns ping -c 2 -W 2 "$GW" >/dev/null 2>&1; then fail "the home router ($GW) answered through the tunnel"; fi
 
+if [ "$RELAY" = 1 ]; then
+  # 6c. the relay holds the fallback to its rate (5 Mbps by default): a 20 MB
+  #     download from the NAS averages no more than 6 Mbps (750 000 B/s).
+  ss -ltn | grep -q "$NAS_VIP:18080 " && fail "$NAS_VIP:18080 is in use"
+  mkdir "$WORK/dl" && head -c 20000000 /dev/urandom >"$WORK/dl/blob"
+  python3 -m http.server --bind "$NAS_VIP" --directory "$WORK/dl" 18080 >/dev/null 2>&1 &
+  HTTP_PID=$!
+  for i in $(seq 1 20); do ss -ltn | grep -q "$NAS_VIP:18080 " && break; sleep 0.25; done
+  speed=$(inns curl -s -m 180 -o /dev/null -w '%{speed_download}' "http://$NAS_VIP:18080/blob") || fail "download over the relay failed"
+  echo "info: 20 MB over the relay at $speed B/s"
+  python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= 750000 else 1)" "$speed" || fail "the download averaged $speed B/s, above 6 Mbps"
+  kill "$HTTP_PID"; HTTP_PID=""
+  ok "relay rate held: $speed B/s"
+
+  # 6d. UDP let through again plus an address change: a direct path answers
+  #     and replaces the relay.
+  inns iptables -D OUTPUT -p udp -j DROP
+  inns ip addr add 10.199.0.3/24 dev nlc-ns
+  moved=no
+  for i in $(seq 1 60); do
+    p=$(inns "$BIN" status | sed -n 's/^path: //p')
+    if [ -n "$p" ] && [[ $p != relay* ]]; then moved=yes; echo "info: direct after ~${i}s: $p"; break; fi
+    sleep 1
+  done
+  [ "$moved" = yes ] || fail "still on the relay 60 s after UDP was let through: $(inns "$BIN" status)"
+  inns "$BIN" status | grep -q "^direct to" || fail "status: $(inns "$BIN" status)"
+  code=$(inns curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$NAS_VIP/v1/gateway/device-info")
+  [ "$code" = 200 ] || fail "panel after moving to the direct path: HTTP $code"
+  ok "moved to the direct path: $p"
+
+  # 6e. UDP blocked again plus another address change: back on the relay.
+  inns iptables -I OUTPUT -p udp -j DROP
+  inns ip addr del 10.199.0.3/24 dev nlc-ns
+  back=no
+  for i in $(seq 1 45); do
+    if inns "$BIN" status | grep -q "^path: relay"; then back=yes; echo "info: back on the relay after ~${i}s"; break; fi
+    sleep 1
+  done
+  [ "$back" = yes ] || fail "not back on the relay 45 s after UDP was blocked: $(inns "$BIN" status)"
+  for i in $(seq 1 30); do
+    code=$(inns curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$NAS_VIP/v1/gateway/device-info") || code=000
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "panel after moving back to the relay: HTTP $code"
+  ok "back on the relay"
+fi
+
 # 7. removing the device cuts the tunnel within one sweep
 code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X DELETE -H @"$AUTH" "http://$HOST_IP/v1/users/remote/devices/$DEVICE_ID")
 [ "$code" = 200 ] || fail "removing the device: HTTP $code"
@@ -317,4 +410,12 @@ for i in $(seq 1 30); do
 done
 [ "$cut" = yes ] || fail "still connected 30 s after the device was removed"
 ok "removed device is cut off"
+if [ "$RELAY" = 1 ]; then
+  # the NAS closes the fallback connection; the client's next one is told
+  # the device is gone, and `up` ends
+  for i in $(seq 1 30); do kill -0 "$UP_PID" 2>/dev/null || break; sleep 1; done
+  ! kill -0 "$UP_PID" 2>/dev/null || fail "up still runs 30 s after the device was removed: $(cat "$NIMOLINK_CONFIG/up.log")"
+  grep -q "removed from the NAS" "$NIMOLINK_CONFIG/up.log" || fail "up ended without saying the device was removed: $(cat "$NIMOLINK_CONFIG/up.log")"
+  ok "up ended: the device was removed"
+fi
 echo "ALL OK"

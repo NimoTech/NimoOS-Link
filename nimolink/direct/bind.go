@@ -1,10 +1,12 @@
 // Package direct is the client side of NimoLink's direct connection: a
-// WireGuard Bind that shares its UDP port with STUN, and the agent that
-// learns the reflexive address and checks which of the NAS's addresses
-// answers. Usable from any wireguard-go host (the iOS bridge included).
+// WireGuard Bind that shares its UDP port with STUN and can carry WireGuard
+// over the relay fallback, and the agent that learns the reflexive address
+// and checks which of the NAS's addresses answers. Usable from any
+// wireguard-go host (the iOS bridge included).
 package direct
 
 import (
+	"io"
 	"net/netip"
 	"sync"
 
@@ -16,12 +18,17 @@ import (
 // Bind wraps a WireGuard Bind: received STUN messages go to the STUN handler
 // (their size is set to 0, which wireguard-go skips), everything else to
 // WireGuard; SendTo writes from the same socket, so the NAT maps both alike.
+// Packets for RelayEndpoint go into the fallback connection (relay.go).
 type Bind struct {
 	conn.Bind
 
 	mu     sync.RWMutex
 	onSTUN func(pkt []byte, from netip.AddrPort)
 	send   func(pkt []byte, to netip.AddrPort) error // tests replace it
+
+	relay     io.Writer     // the fallback connection, or nil
+	relayIn   chan []byte   // packets from it, for the current Open
+	relayDone chan struct{} // closed by Close
 }
 
 func NewBind(inner conn.Bind) *Bind {
@@ -58,7 +65,16 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	out := make([]conn.ReceiveFunc, len(fns))
+	relayEP, err := b.Bind.ParseEndpoint(RelayEndpoint.String())
+	if err != nil {
+		b.Bind.Close()
+		return nil, 0, err
+	}
+	in, done := make(chan []byte, relayQueue), make(chan struct{})
+	b.mu.Lock()
+	b.relayIn, b.relayDone = in, done
+	b.mu.Unlock()
+	out := make([]conn.ReceiveFunc, len(fns), len(fns)+1)
 	for i, fn := range fns {
 		fn := fn
 		out[i] = func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
@@ -76,5 +92,25 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			return n, err
 		}
 	}
-	return out, actual, nil
+	return append(out, relayReceive(in, done, relayEP)), actual, nil
+}
+
+// Send writes to the network, or into the fallback connection for
+// RelayEndpoint.
+func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
+	if isRelay(ep) {
+		return b.sendRelay(bufs)
+	}
+	return b.Bind.Send(bufs, ep)
+}
+
+// Close also ends the receive function that hands out relayed packets.
+func (b *Bind) Close() error {
+	b.mu.Lock()
+	if b.relayDone != nil {
+		close(b.relayDone)
+		b.relayIn, b.relayDone = nil, nil
+	}
+	b.mu.Unlock()
+	return b.Bind.Close()
 }

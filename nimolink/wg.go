@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/NimoTech/NimoOS-Link/nimolink/direct"
 )
 
 const ifName = "nimolink0"
@@ -192,8 +194,12 @@ func statusLine(st TunnelStatus, now time.Time) string {
 	case now.Sub(st.LastHandshake) > staleAfter:
 		return fmt.Sprintf("stale: last handshake %s ago with %s — the NAS stopped answering", now.Sub(st.LastHandshake).Round(time.Second), st.Endpoint)
 	}
-	return fmt.Sprintf("direct to %s, handshake %s ago, received %d bytes, sent %d bytes",
-		st.Endpoint, now.Sub(st.LastHandshake).Round(time.Second), st.Rx, st.Tx)
+	how := "direct to " + st.Endpoint
+	if st.Endpoint == direct.RelayEndpoint.String() {
+		how = "over the relay"
+	}
+	return fmt.Sprintf("%s, handshake %s ago, received %d bytes, sent %d bytes",
+		how, now.Sub(st.LastHandshake).Round(time.Second), st.Rx, st.Tx)
 }
 
 var (
